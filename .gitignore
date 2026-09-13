@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+data/
+.env.local
+*.log
+public/generated-images/
+public/vendor/wuying/
+课前开发资料包.zip
+猫品牌知识库.docx
+app-api/aliyun-bailian-knowledge-base-api-guide.md
+.env.*
+!.env.example
