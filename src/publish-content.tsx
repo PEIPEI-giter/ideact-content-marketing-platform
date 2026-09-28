@@ -27,8 +27,11 @@ type PublishJob = {
   publishedAt?: string;
   providerTaskId?: string;
   providerResult?: string;
+  providerSteps?: string;
+  providerDuration?: string;
   errorMessage?: string;
-  imageTransfer?: { image: number; totalImages: number; completed: number; total: number };
+  syncWarning?: string;
+  imageTransfer?: { image: number; totalImages: number; completed: number; total: number; mode?: "direct-url" };
 };
 
 const statusLabels: Record<PublishJob["status"], string> = {
@@ -54,6 +57,25 @@ function localDateTimeInputMin() {
 
 function errorText(value: unknown, fallback: string) {
   return value && typeof value === "object" && "message" in value && typeof value.message === "string" ? value.message : fallback;
+}
+
+export function summarizeProviderResult(value: string) {
+  const raw = value.trim();
+  if (!raw) return { summary: "阿里云未返回执行说明。", technical: "" };
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const detail = [parsed.result, parsed.answer].find((item) => typeof item === "string" && item.trim()) as string | undefined;
+    const firstLine = detail?.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+    const stepValue = parsed.actual_steps ?? parsed.steps_executed;
+    return {
+      summary: (firstLine || (parsed.success === true ? "任务执行完成，等待人工核验平台结果。" : "阿里云任务已返回结果。" )).slice(0, 300),
+      steps: typeof stepValue === "number" || typeof stepValue === "string" ? String(stepValue) : undefined,
+      success: typeof parsed.success === "boolean" ? parsed.success : undefined,
+      technical: raw,
+    };
+  } catch {
+    return { summary: raw.slice(0, 500), technical: raw.length > 500 ? raw : "" };
+  }
 }
 
 export function getPublishBlockReason(input: {
@@ -95,7 +117,17 @@ export function PublishContentPage({ onSubmitted }: { onSubmitted?: (job: { id: 
   const record = records.find((item) => item.id === recordId);
   const copies = record?.copy?.copies || [];
   const copy = copies.find((item) => item.channel === channel);
-  const availableImages = useMemo(() => [...new Set((record?.images || []).filter((item) => item.channel === channel).flatMap((item) => item.images.map((image) => image.localUrl || "")).filter((url) => /^\/generated-images\/[a-zA-Z0-9_.-]+\.(png|jpg|jpeg|webp)$/.test(url)))], [record, channel]);
+  const availableImages = useMemo(() => {
+    const images = new Map<string, { localPath: string; sourceUrl: string }>();
+    for (const result of (record?.images || []).filter((item) => item.channel === channel)) {
+      for (const image of result.images) {
+        if (image.localUrl && /^\/generated-images\/[a-zA-Z0-9_.-]+\.(png|jpg|jpeg|webp)$/.test(image.localUrl) && /^https:\/\//.test(image.url)) {
+          images.set(image.localUrl, { localPath: image.localUrl, sourceUrl: image.url });
+        }
+      }
+    }
+    return [...images.values()];
+  }, [record, channel]);
   const selectedDevice = devices.find((item) => item.id === deviceId);
   const publishBlockReason = getPublishBlockReason({
     hasCopy: Boolean(copy), approved, deviceRunning: selectedDevice?.runtimeStatus === "RUNNING",
@@ -113,9 +145,9 @@ export function PublishContentPage({ onSubmitted }: { onSubmitted?: (job: { id: 
   }, [recordId, records]);
 
   useEffect(() => {
-    setImagePaths(availableImages.slice(0, 9));
+    setImagePaths(availableImages.slice(0, 9).map((image) => image.localPath));
     setApproved(false);
-  }, [recordId, channel, availableImages.join("|")]);
+  }, [recordId, channel, availableImages.map((image) => `${image.localPath}:${image.sourceUrl}`).join("|")]);
 
   useEffect(() => { setSubmittedId(""); setSubmitError(""); }, [recordId, channel, deviceId, mode, scheduledLocal, imagePaths.join("|")]);
 
@@ -161,7 +193,8 @@ export function PublishContentPage({ onSubmitted }: { onSubmitted?: (job: { id: 
     if (submitting || submittedId) return;
     if (publishBlockReason || !record || !copy || !selectedDevice) { setSubmitError(publishBlockReason || "发布信息不完整，请重新选择内容和云手机。"); return; }
     const scheduledAt = mode === "scheduled" ? new Date(scheduledLocal).toISOString() : null;
-    const draft = { sourceRecordId: record.id, objectName: record.objectName, topicTitle: record.topic?.title || copy.title || "未命名内容", deviceId, channel, copy, imagePaths, mode, scheduledAt, approved: true };
+    const imageSources = imagePaths.map((imagePath) => availableImages.find((image) => image.localPath === imagePath)?.sourceUrl || "");
+    const draft = { sourceRecordId: record.id, objectName: record.objectName, topicTitle: record.topic?.title || copy.title || "未命名内容", deviceId, channel, copy, imagePaths, imageSources, mode, scheduledAt, approved: true };
     const fingerprint = JSON.stringify(draft);
     if (submissionRef.current?.fingerprint !== fingerprint) submissionRef.current = { fingerprint, key: crypto.randomUUID() };
     setSubmitting(true);
@@ -222,8 +255,8 @@ export function PublishContentPage({ onSubmitted }: { onSubmitted?: (job: { id: 
               {copies.map((item) => <button className={`choice-chip${channel === item.channel ? " is-selected" : ""}`} type="button" key={item.channel} aria-pressed={channel === item.channel} onClick={() => setChannel(item.channel)}>{item.channel}</button>)}
             </div>
             <p className="muted-text">只显示本条记录中实际生成的渠道文案。</p>
-            {availableImages.length > 0 ? <div className="publish-image-list">{availableImages.map((url) => <label className="publish-image-option" key={url}><input type="checkbox" checked={imagePaths.includes(url)} disabled={!imagePaths.includes(url) && imagePaths.length >= 9} onChange={(event) => { setImagePaths((current) => event.target.checked ? [...current, url] : current.filter((item) => item !== url)); setApproved(false); }} /><img src={url} alt="待发布配图" /><span>{imagePaths.includes(url) ? "已选择" : "未选择"}</span></label>)}</div> : <div className="publish-notice"><ImageIcon size={17} /> 此渠道暂无系统保存的生成图片，可仅发布文字。</div>}
-            {imagePaths.length > 0 && <div className="publish-notice"><ImageIcon size={17} /> 图片已保存在本机并关联创作记录。发布时会分块传入云手机并校验，可能需要数分钟；请勿重复提交。</div>}
+            {availableImages.length > 0 ? <div className="publish-image-list">{availableImages.map((image) => <label className="publish-image-option" key={image.localPath}><input type="checkbox" checked={imagePaths.includes(image.localPath)} disabled={!imagePaths.includes(image.localPath) && imagePaths.length >= 9} onChange={(event) => { setImagePaths((current) => event.target.checked ? [...current, image.localPath] : current.filter((item) => item !== image.localPath)); setApproved(false); }} /><img src={image.localPath} alt="待发布配图" /><span>{imagePaths.includes(image.localPath) ? "已选择" : "未选择"}</span></label>)}</div> : <div className="publish-notice"><ImageIcon size={17} /> 此渠道暂无带有效源地址的生成图片，可仅发布文字或重新生成配图。</div>}
+            {imagePaths.length > 0 && <div className="publish-notice"><ImageIcon size={17} /> 图片已保存在本机。发布时将通过阿里云 SendFile 整图直传云手机，不再拆分图片；千问临时地址过期时会明确停止并提示重新生成。</div>}
             </>}
           </section>
 
@@ -264,10 +297,14 @@ export function PublishContentPage({ onSubmitted }: { onSubmitted?: (job: { id: 
 
       <section className="publish-section publish-history">
         <div className="panel-heading social-heading"><div><h3>发布记录</h3><p>阿里云任务完成不等于帖子已上线；待人工核验后才记为已发布。</p></div><button className="small-icon-button" type="button" aria-label="刷新发布记录" onClick={refreshJobs}><RefreshCw size={16} /></button></div>
-        {jobs.length === 0 ? <div className="publish-notice">暂无发布任务。</div> : <div className="publish-job-list">{jobs.map((job) => <article className="publish-job" key={job.id}>
-          <div><strong>{job.objectName} · {job.topicTitle}</strong><p>{job.channel} · {statusLabels[job.status]} · {job.scheduledAt ? `计划 ${timeText(job.scheduledAt)}` : `提交 ${timeText(job.createdAt)}`}</p>{job.status === "PREPARING" && job.imageTransfer && <p>传入第 {job.imageTransfer.image}/{job.imageTransfer.totalImages} 张图片：{Math.floor(job.imageTransfer.completed / job.imageTransfer.total * 100)}%</p>}{job.providerTaskId && <p>阿里云任务：{job.providerTaskId}</p>}{job.providerResult && <p>执行反馈：{job.providerResult}</p>}{job.errorMessage && <p className="publish-job-error">{job.errorMessage}</p>}{job.publishedAt && <p>人工确认：{timeText(job.publishedAt)}</p>}</div>
-          <div className="publish-job-actions">{["SCHEDULED", "QUEUED"].includes(job.status) && <button className="secondary-button" type="button" onClick={() => jobAction(job.id, "cancel")}>取消</button>}{job.status === "REVIEW_REQUIRED" && <button className="secondary-button" type="button" onClick={() => jobAction(job.id, "confirm")}>已在平台核实发布</button>}</div>
-        </article>)}</div>}
+        {jobs.length === 0 ? <div className="publish-notice">暂无发布任务。</div> : <div className="publish-job-list">{jobs.map((job) => { const feedback = job.providerResult ? summarizeProviderResult(job.providerResult) : null; return <article className="publish-job" key={job.id}>
+          <div><strong>{job.objectName} · {job.topicTitle}</strong><p>{job.channel} · {statusLabels[job.status]} · {job.scheduledAt ? `计划 ${timeText(job.scheduledAt)}` : `提交 ${timeText(job.createdAt)}`}</p>{job.status === "PREPARING" && job.imageTransfer && <p>{job.imageTransfer.mode === "direct-url" ? `整图直传：已完成 ${job.imageTransfer.completed}/${job.imageTransfer.totalImages} 张` : `传入第 ${job.imageTransfer.image}/${job.imageTransfer.totalImages} 张图片：${Math.floor(job.imageTransfer.completed / job.imageTransfer.total * 100)}%`}</p>}{job.providerTaskId && <p>阿里云任务：{job.providerTaskId}</p>}{(job.providerSteps || job.providerDuration) && <p>执行进度：{job.providerSteps ? `${job.providerSteps} 步` : "步骤未返回"}{job.providerDuration ? ` · ${job.providerDuration} 秒` : ""}</p>}{feedback && <div className="provider-feedback"><p><strong>执行反馈：</strong>{feedback.summary}{feedback.steps ? ` · ${feedback.steps} 步` : ""}</p>{feedback.technical && <details><summary>查看技术详情</summary><pre>{feedback.technical}</pre></details>}</div>}{job.syncWarning && <p className="publish-job-warning">{job.syncWarning}</p>}{job.errorMessage && <p className="publish-job-error">{job.errorMessage}</p>}{job.publishedAt && <p>人工确认：{timeText(job.publishedAt)}</p>}</div>
+          <div className="publish-job-actions">
+            {job.status !== "CANCELED" && <button className="secondary-button" type="button" onClick={() => onSubmitted?.({ id: job.id, deviceId: job.deviceId })}>{["SCHEDULED", "QUEUED", "PREPARING", "RUNNING"].includes(job.status) ? "查看实时进度" : "查看执行详情"}</button>}
+            {["SCHEDULED", "QUEUED"].includes(job.status) && <button className="secondary-button" type="button" onClick={() => jobAction(job.id, "cancel")}>取消</button>}
+            {job.status === "REVIEW_REQUIRED" && <button className="secondary-button" type="button" onClick={() => jobAction(job.id, "confirm")}>已在平台核实发布</button>}
+          </div>
+        </article>; })}</div>}
       </section>
     </section>
   );

@@ -94,4 +94,43 @@ describe("createAliyunCloudPhoneProviderFromEnv", () => {
     expect(callApi.mock.calls[0][1]).toMatchObject({ query: { "InstanceIds.1": "acp-test" } });
     expect(Object.keys((callApi.mock.calls[0][1] as { query: Record<string, string> }).query)).toEqual(["InstanceIds.1"]);
   });
+
+  it("prepares and indexes only the current publishing album", async () => {
+    const provider = createAliyunCloudPhoneProviderFromEnv({
+      ALIYUN_ACCESS_KEY_ID: "id", ALIYUN_ACCESS_KEY_SECRET: "secret", ALIYUN_CLOUD_PHONE_INSTANCE_ID: "acp-a",
+    });
+    const client = (provider as unknown as { client: { callApi: (...args: unknown[]) => Promise<unknown> } }).client;
+    const callApi = vi.spyOn(client, "callApi").mockResolvedValue({ body: { Data: [{ InstanceId: "acp-a", InvocationStatus: "Success", Output: "ok" }] } });
+    const device = { id: "acp-a", instanceId: "acp-a", name: "phone", tenantId: "local", runtimeStatus: "RUNNING", occupancyStatus: "IDLE" } as const;
+    const directory = "/sdcard/Pictures/IdeactPublish-b8aa39ced63d";
+
+    await provider.preparePublishAlbum({ device, directory });
+    await provider.refreshPublishImages({ device, paths: [`${directory}/01.png`, `${directory}/02.webp`] });
+
+    const commands = callApi.mock.calls.map((call) => (call[1] as { query: { CommandContent: string } }).query.CommandContent);
+    expect(commands[0]).toContain(`mkdir -p '${directory}'`);
+    expect(commands[1]).toContain(`file://${directory}/01.png`);
+    expect(commands[1]).toContain(`file://${directory}/02.webp`);
+    await expect(provider.preparePublishAlbum({ device, directory: "/sdcard/Pictures/../../data" })).rejects.toThrow(/路径/);
+  });
+
+  it("retries transient status-query disconnects without creating another Agent task", async () => {
+    const provider = createAliyunCloudPhoneProviderFromEnv({
+      ALIYUN_ACCESS_KEY_ID: "id", ALIYUN_ACCESS_KEY_SECRET: "secret", ALIYUN_CLOUD_PHONE_INSTANCE_ID: "acp-a",
+    });
+    const client = (provider as unknown as { client: { callApi: (...args: unknown[]) => Promise<unknown> } }).client;
+    const callApi = vi.spyOn(client, "callApi")
+      .mockRejectedValueOnce(new Error("socket hang up"))
+      .mockResolvedValueOnce({ body: { Tasks: [{ TaskId: "task-1", CurrentStatus: "COMPLETED", TaskResult: "done", Reason: "CALL_FOR_USER" }] } });
+    const now = new Date().toISOString();
+    const task = await provider.describeAgentTask({ task: {
+      id: "local", tenantId: "local", userId: "local", connectionId: "", deviceId: "acp-a", instruction: "",
+      status: "RUNNING", providerTaskId: "task-1", createdAt: now, updatedAt: now,
+    } });
+
+    expect(task.status).toBe("COMPLETED");
+    expect(task.errorMessage).toBeUndefined();
+    expect(callApi).toHaveBeenCalledTimes(2);
+    expect(callApi.mock.calls.every((call) => (call[0] as { action: string }).action === "DescribeAgentTask")).toBe(true);
+  });
 });

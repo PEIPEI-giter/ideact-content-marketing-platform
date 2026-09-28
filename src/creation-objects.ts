@@ -136,6 +136,41 @@ export function mergeCreationObjects(userObjects: CreationObject[]) {
   return [...builtInCreationObjects.map((item) => userById.get(item.id) || item), ...userObjects.filter((item) => !builtInCreationObjects.some((builtIn) => builtIn.id === item.id))];
 }
 
+export function normalizeCreationObject(object: CreationObject): CreationObject {
+  return {
+    ...object,
+    name: object.name.trim(),
+    positioning: object.positioning.trim(),
+    contentStyle: object.contentStyle.trim(),
+    knowledgeBaseId: object.knowledgeBaseId.trim(),
+    knowledgeBaseName: object.knowledgeBaseName.trim() || object.knowledgeBaseId.trim(),
+    styleSamples: object.styleSamples.map((item) => item.trim()).filter(Boolean),
+    bannedExpressions: object.bannedExpressions.map((item) => item.trim()).filter(Boolean),
+  };
+}
+
+export function validateCreationObject(object: CreationObject) {
+  const errors: Partial<Record<"name" | "positioning" | "contentStyle" | "knowledgeBaseId" | "topicWeights", string>> = {};
+  if (!object.name.trim()) errors.name = "请输入对象名称。";
+  if (!object.positioning.trim()) errors.positioning = "请输入对象定位。";
+  if (!object.contentStyle.trim()) errors.contentStyle = "请输入内容风格。";
+  if (!object.knowledgeBaseId.trim()) errors.knowledgeBaseId = "请选择关联知识库。";
+  const weights = Object.values(object.topicWeights);
+  if (weights.some((value) => !Number.isFinite(value) || value < 0 || value > 100)) {
+    errors.topicWeights = "每项权重必须在 0 到 100 之间。";
+  } else if (weights.reduce((sum, value) => sum + value, 0) !== 100) {
+    errors.topicWeights = "五项权重合计必须为 100。";
+  }
+  return errors;
+}
+
+export function upsertCreationObject(objects: CreationObject[], object: CreationObject) {
+  const normalized = normalizeCreationObject(object);
+  return objects.some((item) => item.id === normalized.id)
+    ? objects.map((item) => (item.id === normalized.id ? normalized : item))
+    : [...objects, normalized];
+}
+
 export function fuzzyMatchProduct(product: ProductOption, query: string) {
   const normalizedQuery = query.trim().toLowerCase();
   if (!normalizedQuery) return true;

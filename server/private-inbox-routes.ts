@@ -1,6 +1,6 @@
 import path from "node:path";
 import type express from "express";
-import { PrivateInboxStore, parseXhsChatHierarchy, parseXhsNotifications, type InboxAccount, type InboxConversation } from "./private-inbox";
+import { PrivateInboxStore, parseXhsChatPage, parseXhsNotifications, type InboxAccount, type InboxConversation } from "./private-inbox";
 import type { AliyunCloudPhoneProvider } from "./cloud-phone/providers/aliyun-cloud-phone-provider";
 import type { CloudPhoneDevice } from "./cloud-phone/domain/types";
 
@@ -14,11 +14,14 @@ export function registerPrivateInboxRoutes(app: express.Express, dependencies: {
   const store = new PrivateInboxStore(path.join(process.cwd(), "data", "private-inbox.json"));
   let scanning = false;
   app.use("/api/private-inbox", (req, res, next) => {
-    const address = req.socket.remoteAddress || "";
-    const pageOrigin = req.get("origin") || req.get("referer") || "";
-    const localPage = !pageOrigin || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(?:\/|$)/i.test(pageOrigin);
-    if (!/^(::1|127\.0\.0\.1|::ffff:127\.0\.0\.1)$/.test(address) || !localPage) { res.status(403).json({ message: "私信数据仅允许从本机页面访问。" }); return; }
-    next();
+    const pageOrigin = req.get("origin") || "";
+    if (!pageOrigin) { next(); return; }
+    try {
+      const origin = new URL(pageOrigin);
+      const configuredOrigin = process.env.WEB_ORIGIN ? new URL(process.env.WEB_ORIGIN).origin : "";
+      if (origin.host === req.get("host") || origin.origin === configuredOrigin) { next(); return; }
+    } catch { /* Reject malformed origins below. */ }
+    res.status(403).json({ message: "当前页面来源不受信任，请从本系统登录页进入。" });
   });
 
   async function resolvedDevice(provider: AliyunCloudPhoneProvider, account: InboxAccount): Promise<CloudPhoneDevice> {
@@ -90,14 +93,14 @@ export function registerPrivateInboxRoutes(app: express.Express, dependencies: {
     try {
       const accountId = String(req.body?.accountId || "");
       const customerName = String(req.body?.customerName || "").normalize("NFKC").trim();
-      if (!customerName || customerName.length > 80) { res.status(422).json({ message: "请先选择会话或填写当前聊天页的客户名称。" }); return; }
+      if (customerName.length > 80) { res.status(422).json({ message: "客户名称最多 80 个字符。" }); return; }
       const account = (await store.read()).accounts.find((item) => item.id === accountId && item.active);
       if (!account) { res.status(409).json({ message: "账号未关联当前设备，请先在左侧确认账号。" }); return; }
       const provider = dependencies.getProvider();
       const device = await resolvedDevice(provider, account);
       const output = await provider.runReadOnlyCommand(device, CHAT_COMMAND);
-      const visible = await parseXhsChatHierarchy(output, customerName);
-      res.json(await store.syncMessages(accountId, customerName, visible));
+      const page = await parseXhsChatPage(output, customerName, account.name);
+      res.json(await store.syncMessages(accountId, page.customerName, page.messages));
     } catch (error) { res.status(502).json({ message: dependencies.safeError(error) }); }
   });
 

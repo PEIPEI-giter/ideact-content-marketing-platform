@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildGroundedPrompt, loadKnowledgeBases, normalizeRetrieveNodes, toSafeError } from "../server/knowledge-utils";
+import { buildGroundedPrompt, hasKnowledgeBaseIndex, loadKnowledgeBases, normalizeRetrieveNodes, toSafeError } from "../server/knowledge-utils";
 
 describe("knowledge utils", () => {
   it("loads two knowledge bases without exposing secrets", () => {
@@ -20,8 +20,26 @@ describe("knowledge utils", () => {
     expect(bases[1]).toMatchObject({ id: "product", workspaceId: "workspace-b", endpoint: "bailian-vpc.cn-beijing.aliyuncs.com" });
   });
 
+  it("discovers additional numbered knowledge bases without a fixed upper limit", () => {
+    const bases = loadKnowledgeBases({
+      KB_3_ID: "third",
+      KB_3_NAME: "第三个知识库",
+      KB_3_WORKSPACE_ID: "workspace-third",
+      KB_3_INDEX_ID: "index-third",
+    });
+
+    expect(bases).toEqual([
+      expect.objectContaining({ id: "third", name: "第三个知识库", indexId: "index-third" }),
+    ]);
+  });
+
   it("rejects partial knowledge base config", () => {
     expect(() => loadKnowledgeBases({ KB_1_ID: "brand", KB_1_NAME: "品牌知识库" })).toThrow("配置不完整");
+  });
+
+  it("checks that the configured knowledge base exists in its workspace", () => {
+    expect(hasKnowledgeBaseIndex([{ id: "index-a" }, { id: "index-b" }], "index-b")).toBe(true);
+    expect(hasKnowledgeBaseIndex([{ id: "index-a" }], "missing")).toBe(false);
   });
 
   it("normalizes retrieve nodes into numbered citations", () => {

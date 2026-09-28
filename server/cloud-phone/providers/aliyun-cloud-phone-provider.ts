@@ -154,7 +154,7 @@ export class AliyunCloudPhoneProvider implements CloudPhoneProvider {
       "InstanceIds.1": input.device.instanceId,
       UserPrompt: input.instruction,
       MaxSteps: String(clampNumber(process.env.ALIYUN_MAX_STEPS, 30, 1000, 30)),
-      TimeoutSeconds: String(clampNumber(process.env.ALIYUN_TASK_TIMEOUT_SECONDS, 300, 3600, 300)),
+      TimeoutSeconds: String(clampNumber(process.env.ALIYUN_TASK_TIMEOUT_SECONDS, 300, 3600, 600)),
       BizRegionId: this.config.regionId,
     });
     const task = firstTaskModel(body, input.device.instanceId);
@@ -175,17 +175,23 @@ export class AliyunCloudPhoneProvider implements CloudPhoneProvider {
     };
   }
 
-  async sendFileToDevice(input: { device: CloudPhoneDevice; sourceUrl: string; targetPath: string; idempotencyKey: string }) {
-    const response = await this.call("SendFile", {
-      "AndroidInstanceIdList.1": input.device.instanceId,
-      SourceFilePath: input.targetPath,
-      UploadType: "DOWNLOAD_URL",
-      UploadUrl: input.sourceUrl,
-      ClientToken: input.idempotencyKey.slice(0, 100),
-    });
+  async sendFileToDevice(input: { device: CloudPhoneDevice; sourceUrl: string; targetPath: string; fileMd5?: string; idempotencyKey: string }) {
+    let response: any;
+    try {
+      response = await this.call("SendFile", {
+        "AndroidInstanceIdList.1": input.device.instanceId,
+        SourceFilePath: input.targetPath,
+        UploadType: "DOWNLOAD_URL",
+        UploadUrl: input.sourceUrl,
+        ...(input.fileMd5 ? { FileMd5: input.fileMd5 } : {}),
+        ClientToken: input.idempotencyKey.slice(0, 100),
+      });
+    } catch {
+      throw new Error("云手机整图直传提交失败。千问图片地址可能已过期，或 AccessKey 缺少 SendFile 权限；请重新生成图片或检查权限后再提交。");
+    }
     const taskId = response?.Data?.find?.((item: { AndroidInstanceId?: string }) => item.AndroidInstanceId === input.device.instanceId)?.TaskId || response?.TaskId;
     if (!taskId) throw new Error("阿里云未返回图片传输任务编号，无法确认图片已进入云手机。 ");
-    for (let attempt = 0; attempt < 20; attempt += 1) {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 3000));
       const statusResponse = await this.call("DescribeTasks", { "TaskIds.1": taskId, MaxResults: "10" });
       const task = statusResponse?.Data?.find?.((item: { TaskId?: string }) => item.TaskId === taskId);
@@ -194,6 +200,24 @@ export class AliyunCloudPhoneProvider implements CloudPhoneProvider {
       if (["Failed", "Skipped", "PartFinished"].includes(task.TaskStatus)) throw new Error(`图片传入云手机失败：${task.ErrorMsg || task.ErrorCode || task.TaskStatus}`);
     }
     throw new Error("图片传输状态查询超时，未确认图片已经进入云手机。请先检查云手机文件，再决定是否重试。 ");
+  }
+
+  async preparePublishAlbum(input: { device: CloudPhoneDevice; directory: string }) {
+    assertPublishAlbumDirectory(input.directory);
+    await this.runSyncCommand(
+      input.device,
+      `rm -rf '${input.directory}' && mkdir -p '${input.directory}' && printf IDEACT_ALBUM_READY`,
+      "云手机发布相册创建失败",
+    );
+  }
+
+  async refreshPublishImages(input: { device: CloudPhoneDevice; paths: string[] }) {
+    if (input.paths.length === 0) return;
+    input.paths.forEach(assertPublishImagePath);
+    const scans = input.paths
+      .map((filePath) => `am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d 'file://${filePath}' >/dev/null`)
+      .join(" && ");
+    await this.runSyncCommand(input.device, `${scans} && sleep 1 && printf IDEACT_MEDIA_READY`, "云手机图片索引刷新失败");
   }
 
   async sendLocalImageToDevice(input: { device: CloudPhoneDevice; image: Buffer; targetPath: string; onProgress?: (completed: number, total: number) => Promise<void> }) {
@@ -220,7 +244,16 @@ export class AliyunCloudPhoneProvider implements CloudPhoneProvider {
 
   async describeAgentTask(input: { task: AgentTask }): Promise<AgentTask> {
     if (!input.task.providerTaskId) return input.task;
-    const body = await this.call("DescribeAgentTask", { "TaskIds.1": input.task.providerTaskId });
+    let body: any;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        body = await this.call("DescribeAgentTask", { "TaskIds.1": input.task.providerTaskId });
+        break;
+      } catch (error) {
+        if (attempt === 3 || !isTransientDescribeError(error)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+      }
+    }
     const task = firstTaskModel(body);
     if (!task) return input.task;
     return mergeProviderTask(input.task, task);
@@ -246,6 +279,27 @@ export class AliyunCloudPhoneProvider implements CloudPhoneProvider {
     return mergeProviderTask(task, providerTask);
   }
 
+  private async runSyncCommand(device: CloudPhoneDevice, command: string, failurePrefix: string): Promise<string> {
+    let body: any;
+    try {
+      body = await this.call("RunSyncCommand", {
+        "InstanceIds.1": device.instanceId,
+        CommandContent: command,
+        Timeout: "30",
+        WaitTime: "3000",
+        AgentType: "EdsAgent",
+        ContentEncoding: "PlainText",
+      });
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error && typeof error.code === "string"
+        ? error.code.replace(/[^a-zA-Z0-9_.-]/g, "").slice(0, 80) : "unknown";
+      throw new Error(`${failurePrefix}（${code}）。请确认设备在线且 AccessKey 有 RunSyncCommand 权限。`);
+    }
+    const result = body?.Data?.find?.((item: { InstanceId?: string }) => item.InstanceId === device.instanceId) || body?.Data?.[0];
+    if (result?.InvocationStatus !== "Success") throw new Error(`${failurePrefix}：${result?.ErrorMsg || result?.ErrorCode || "远程命令未成功"}。`);
+    return String(result.Output || "");
+  }
+
   private async call(action: string, query: Record<string, string>) {
     const request = new OpenApiRequest({ query });
     const params = new Params({
@@ -262,6 +316,17 @@ export class AliyunCloudPhoneProvider implements CloudPhoneProvider {
     const response = await this.client.callApi(params, request, new RuntimeOptions({ readTimeout: 20000, connectTimeout: 10000 }));
     return response.body;
   }
+}
+
+const publishAlbumPattern = /^\/sdcard\/Pictures\/IdeactPublish-[a-f0-9]{8,12}$/;
+const publishImagePattern = /^\/sdcard\/Pictures\/IdeactPublish-[a-f0-9]{8,12}\/\d{2}\.(png|jpg|jpeg|webp)$/i;
+
+function assertPublishAlbumDirectory(directory: string) {
+  if (!publishAlbumPattern.test(directory)) throw new Error("云手机发布相册路径不合法。");
+}
+
+function assertPublishImagePath(filePath: string) {
+  if (!publishImagePattern.test(filePath)) throw new Error("云手机发布图片路径不合法。");
 }
 
 function normalizeRuntimeStatus(status: unknown): CloudPhoneDevice["runtimeStatus"] {
@@ -298,15 +363,22 @@ function normalizeAgentTaskStatus(status: unknown): AgentTask["status"] {
 }
 
 function mergeProviderTask(task: AgentTask, providerTask: any): AgentTask {
+  const status = normalizeAgentTaskStatus(providerTask.CurrentStatus);
+  const hasTerminalError = ["FAILED", "TIMEOUT", "CANCELED", "STOPPED"].includes(status);
   return {
     ...task,
-    status: normalizeAgentTaskStatus(providerTask.CurrentStatus),
+    status,
     result: providerTask.TaskResult || task.result,
-    errorMessage: providerTask.FailedReason || providerTask.Reason || task.errorMessage,
+    errorMessage: hasTerminalError ? providerTask.FailedReason || providerTask.Reason || task.errorMessage : undefined,
     steps: providerTask.Steps || task.steps,
     duration: providerTask.TaskDuration || task.duration,
     updatedAt: new Date().toISOString(),
   };
+}
+
+export function isTransientDescribeError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return /socket hang up|ECONNRESET|ETIMEDOUT|EAI_AGAIN|network|timeout|temporarily unavailable/i.test(message);
 }
 
 function clampNumber(raw: string | undefined, min: number, max: number, fallback: number) {

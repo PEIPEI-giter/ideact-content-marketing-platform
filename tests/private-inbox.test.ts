@@ -2,8 +2,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { PrivateInboxStore, parseXhsChatHierarchy, parseXhsNotifications } from "../server/private-inbox";
-import { filterInboxConversations } from "../src/private-inbox";
+import { detectXhsLoggedOut, isPrivateInboxNoise, PrivateInboxStore, parseXhsChatHierarchy, parseXhsChatPage, parseXhsNotifications } from "../server/private-inbox";
+import { canSyncCurrentChat, filterInboxConversations } from "../src/private-inbox";
 
 const dirs: string[] = [];
 afterEach(async () => { await Promise.all(dirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true }))); });
@@ -89,14 +89,43 @@ describe("private inbox device and account filters", () => {
     expect(filterInboxConversations(inbox, "account-a").map((item) => item.id)).toEqual(["conversation-a"]);
     expect(filterInboxConversations(inbox, "all").map((item) => item.id)).toEqual(["conversation-b", "conversation-a"]);
   });
+
+  it("allows current-page sync without requiring a manually entered customer name", () => {
+    expect(canSyncCurrentChat("account-a", "")).toBe(true);
+    expect(canSyncCurrentChat("", "")).toBe(false);
+    expect(canSyncCurrentChat("account-a", "sync")).toBe(false);
+  });
 });
 
 describe("private inbox chat sync", () => {
   const xml = `<hierarchy><node package="com.xingin.xhs" class="android.widget.FrameLayout" bounds="[0,0][1080,1920]"><node package="com.xingin.xhs" class="android.widget.TextView" text="返回" bounds="[0,50][90,130]"/><node package="com.xingin.xhs" class="android.widget.TextView" text="小橘" bounds="[400,50][600,130]"/><node package="com.xingin.xhs" class="android.widget.TextView" text="今天 10:00" bounds="[450,400][650,450]"/><node package="com.xingin.xhs" class="android.widget.TextView" text="你好" bounds="[40,500][300,560]"/><node package="com.xingin.xhs" class="android.widget.TextView" text="你好呀" bounds="[760,610][1040,670]"/><node package="com.xingin.xhs" class="android.widget.EditText" text="" bounds="[100,1760][850,1840]"/></node></hierarchy>`;
   it("extracts visible sender directions and rejects the wrong chat", async () => {
     expect(await parseXhsChatHierarchy(`UI dump\n${xml}`, "小橘")).toMatchObject([{ sender: "customer", text: "你好" }, { sender: "account", text: "你好呀" }]);
+    expect(await parseXhsChatPage(`UI dump\n${xml}`)).toMatchObject({ customerName: "小橘", messages: [{ sender: "customer", text: "你好" }, { sender: "account", text: "你好呀" }] });
     await expect(parseXhsChatHierarchy(xml, "另一位客户")).rejects.toThrow(/不一致/);
     await expect(parseXhsChatHierarchy("not xml", "小橘")).rejects.toThrow(/控件树/);
+  });
+
+  it("stops chat sync when the Android control tree shows a logged-out account", async () => {
+    const loggedOut = `<hierarchy><node package="com.xingin.xhs" text="账号下线通知"/><node package="com.xingin.xhs" text="重新登录"/></hierarchy>`;
+    expect(detectXhsLoggedOut(loggedOut)).toMatch(/重新登录小红书/);
+    await expect(parseXhsChatHierarchy(loggedOut, "小橘")).rejects.toThrow(/登录失效/);
+  });
+
+  it("filters controls, account names, time labels and duplicate visible messages", async () => {
+    const noisy = `<hierarchy><node package="com.xingin.xhs" class="android.widget.FrameLayout" bounds="[0,0][1080,1920]">
+      <node package="com.xingin.xhs" class="android.widget.TextView" text="返回" bounds="[0,50][90,130]"/>
+      <node package="com.xingin.xhs" class="android.widget.TextView" text="小橘" bounds="[400,50][600,130]"/>
+      <node package="com.xingin.xhs" class="android.widget.TextView" text="下午9:05" bounds="[450,400][650,450]"/>
+      <node package="com.xingin.xhs" class="android.widget.TextView" text="已阅" bounds="[40,480][200,520]"/>
+      <node package="com.xingin.xhs" class="android.widget.TextView" text="账号 A" bounds="[40,530][300,580]"/>
+      <node package="com.xingin.xhs" class="android.widget.TextView" text="在吗" bounds="[40,600][300,660]"/>
+      <node package="com.xingin.xhs" class="android.widget.TextView" text="在吗" bounds="[40,680][300,740]"/>
+      <node package="com.xingin.xhs" class="android.widget.EditText" text="" bounds="[100,1760][850,1840]"/>
+    </node></hierarchy>`;
+    expect(isPrivateInboxNoise("已阅")).toBe(true);
+    expect(isPrivateInboxNoise("下午9:05")).toBe(true);
+    expect((await parseXhsChatPage(noisy, "小橘", "账号A")).messages).toEqual([{ sender: "customer", text: "在吗", timeLabel: "下午9:05" }]);
   });
 
   it("does not duplicate a repeated page and persists the timeline", async () => {
@@ -115,5 +144,27 @@ describe("private inbox chat sync", () => {
     await value.setStatus(conversationId, "AI_HANDLED");
     await value.syncMessages(account.id, "小橘", [...appended.slice(1), { sender: "customer", text: "新问题", timeLabel: "今天 10:00" }]);
     expect((await value.read()).conversations[0].status).toBe("PENDING");
+  });
+
+  it("automatically cleans historical control text and duplicate rows", async () => {
+    const { file } = await store();
+    const observedAt = "2026-09-27T13:00:00.000Z";
+    const state = {
+      accounts: [{ id: "account-a", deviceId: "phone-a", name: "账号A", active: true, linkedAt: observedAt }],
+      conversations: [{
+        id: "conversation-a", accountId: "account-a", customerName: "小橘", customerKey: "小橘", lastPreview: "已阅", lastMessageAt: observedAt, unread: 1, status: "PENDING" as const, notificationKeys: [],
+        messages: [
+          { id: "1", conversationId: "conversation-a", sender: "customer" as const, replyOrigin: "unknown" as const, text: "已阅", observedAt, sendStatus: "received" as const },
+          { id: "2", conversationId: "conversation-a", sender: "customer" as const, replyOrigin: "unknown" as const, text: "在吗", observedAt, sendStatus: "received" as const },
+          { id: "3", conversationId: "conversation-a", sender: "customer" as const, replyOrigin: "unknown" as const, text: "在吗", observedAt, sendStatus: "received" as const },
+          { id: "4", conversationId: "conversation-a", sender: "account" as const, replyOrigin: "unknown" as const, text: "账号 A", observedAt, sendStatus: "observed" as const },
+        ],
+      }],
+    };
+    await fs.writeFile(file, JSON.stringify(state), "utf8");
+    const cleaned = await new PrivateInboxStore(file).read();
+    expect(cleaned.conversations[0].messages.map((item) => item.text)).toEqual(["在吗"]);
+    expect(cleaned.conversations[0].lastPreview).toBe("在吗");
+    expect((await new PrivateInboxStore(file).read()).conversations[0].messages).toHaveLength(1);
   });
 });

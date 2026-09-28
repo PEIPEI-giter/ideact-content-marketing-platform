@@ -1,9 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { createRoot } from "react-dom/client";
+import { createRoot, type Root } from "react-dom/client";
 import { PrivateInboxPage } from "./private-inbox";
+import { OperationsOverview } from "./operations-overview";
+import { recoverImagePrompt } from "./image-prompt-state";
+import { buildPublishProgressView, formatElapsed, type PublishProgressEvent } from "./publish-progress";
 import {
   AlertTriangle,
-  Bell,
+  ArrowRight,
   BookOpenText,
   CheckCircle2,
   ChevronDown,
@@ -12,6 +15,9 @@ import {
   Edit3,
   FileText,
   Layers3,
+  LayoutDashboard,
+  LockKeyhole,
+  LogOut,
   Loader2,
   MonitorSmartphone,
   MousePointer2,
@@ -31,6 +37,7 @@ import {
   UsersRound,
   Wifi,
   WifiOff,
+  X,
 } from "lucide-react";
 import {
   createEmptyUserObject,
@@ -41,18 +48,23 @@ import {
   fuzzyMatchProduct,
   isProductAllowedForObject,
   mergeCreationObjects,
+  normalizeCreationObject,
   objectTypeLabels,
   styleOptions,
+  upsertCreationObject,
+  validateCreationObject,
   type CreationObject,
   type CreationSelection,
   type CreativeBrief,
   type ProductOption,
 } from "./creation-objects";
 import { appendImageToRecord, deleteProductionRecord } from "./production-records";
-import { PublishContentPage } from "./publish-content";
+import { PublishContentPage, summarizeProviderResult } from "./publish-content";
+import { readNavigationState, updateNavigationState, type AppModule, type PhoneTab, type WorkflowStep } from "./navigation-state";
+import { hydrateContentWorkspace, saveContentWorkspace } from "./content-workspace";
 import "./styles.css";
 
-type ModuleKey = "knowledge" | "pipeline" | "phone" | "private";
+type ModuleKey = AppModule;
 
 type ModuleItem = {
   key: ModuleKey;
@@ -173,7 +185,7 @@ type ProductionRecord = {
 };
 
 type ImageSizeOption = "4:3" | "3:4" | "9:16";
-type WorkflowStepNumber = 1 | 2 | 3 | 4 | 5;
+type WorkflowStepNumber = WorkflowStep;
 type ImageModelInfo = {
   id: string;
   name: string;
@@ -181,6 +193,10 @@ type ImageModelInfo = {
   configured: boolean;
   supportsImageToImage: boolean;
   supportedSizes: string[];
+};
+type ModelConfigurationStatus = {
+  text: { configured: boolean; model: string };
+  image: { configured: boolean; model: string };
 };
 type VisualDirection = {
   id: string;
@@ -245,6 +261,7 @@ type CloudPhoneTaskView = {
 
 declare global {
   interface Window {
+    __ideactRoot?: Root;
     Wuying?: {
       WebSDK?: {
         createSession: (type: "appstream", params: Record<string, unknown>) => {
@@ -265,15 +282,121 @@ type ConnectionStatus = "unknown" | "checking" | "ok" | "failed";
 type HealthState = Record<string, { status: ConnectionStatus; message?: string; checkedAt?: string }>;
 
 const modules: ModuleItem[] = [
+  { key: "overview", label: "运营概览", description: "汇总内容资产、生产、发布与账号状态", icon: LayoutDashboard },
   { key: "knowledge", label: "知识库", description: "沉淀品牌资料、行业素材与内容资产", icon: BookOpenText },
   { key: "pipeline", label: "内容生产流水线", description: "规划从选题到成稿的生产流程", icon: Layers3 },
   { key: "phone", label: "云手机发布", description: "管理移动端账号与发布任务", icon: Smartphone },
   { key: "private", label: "私域运营", description: "承接线索、社群和用户触达", icon: UsersRound },
 ];
 
-function App() {
-  const [activeKey, setActiveKey] = useState<ModuleKey>("knowledge");
+type AuthUser = { username: string };
+
+function AuthGate() {
+  const [checking, setChecking] = useState(true);
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [configured, setConfigured] = useState(true);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const [workspaceReady, setWorkspaceReady] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState("");
+
+  async function prepareWorkspace(authenticatedUser: AuthUser) {
+    setWorkspaceReady(false);
+    setWorkspaceError("");
+    try {
+      await hydrateContentWorkspace();
+      setUser(authenticatedUser);
+      setWorkspaceReady(true);
+    } catch (caught) {
+      setUser(authenticatedUser);
+      setWorkspaceError(caught instanceof Error ? caught.message : "内容工作区恢复失败，请重试。");
+    }
+  }
+
+  useEffect(() => {
+    void fetch("/api/auth/status")
+      .then(async (response) => {
+        const data = await response.json();
+        setConfigured(Boolean(data.configured));
+        if (data.authenticated) await prepareWorkspace(data.user);
+        else setUser(null);
+      })
+      .catch(() => setError("无法连接后台服务，请确认 API 服务已经启动。"))
+      .finally(() => setChecking(false));
+  }, []);
+
+  async function login(event: React.FormEvent) {
+    event.preventDefault();
+    if (!username.trim() || !password) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: username.trim(), password }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || "登录失败，请稍后重试。");
+      await prepareWorkspace(data.user);
+      setPassword("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "登录失败，请稍后重试。");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function logout() {
+    await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
+    setUser(null);
+    setWorkspaceReady(false);
+    setWorkspaceError("");
+    setPassword("");
+  }
+
+  if (checking) return <div className="auth-screen"><div className="auth-status"><Loader2 className="spin" size={22} /><strong>正在检查登录状态</strong></div></div>;
+  if (user && workspaceError) return <div className="auth-screen"><div className="auth-panel">
+    <div className="auth-brand"><div className="brand-mark">ID</div><div><strong>Ideact</strong><span>内容营销后台</span></div></div>
+    <div className="error-box" role="alert"><strong>内容数据恢复失败</strong><p>{workspaceError}</p></div>
+    <button className="primary-button auth-submit" type="button" onClick={() => void prepareWorkspace(user)}><RefreshCw size={17} />重新读取</button>
+    <button className="secondary-button auth-submit" type="button" onClick={() => void logout()}><LogOut size={17} />退出登录</button>
+  </div></div>;
+  if (user && !workspaceReady) return <div className="auth-screen"><div className="auth-status"><Loader2 className="spin" size={22} /><strong>正在恢复内容工作区</strong></div></div>;
+  if (user) return <App user={user} onLogout={logout} />;
+
+  return <div className="auth-screen">
+    <form className="auth-panel" onSubmit={login}>
+      <div className="auth-brand"><div className="brand-mark">ID</div><div><strong>Ideact</strong><span>内容营销后台</span></div></div>
+      <div><p className="section-label">安全登录</p><h1>登录后台</h1><p>使用服务端配置的账号和密码进入系统。</p></div>
+      {!configured && <div className="error-box"><strong>登录尚未配置</strong><p>请在服务端 .env 中填写 MVP_USER_EMAIL 和 MVP_USER_PASSWORD 后重启 API 服务。</p></div>}
+      <label className="auth-field"><span>账号</span><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" disabled={!configured || submitting} /></label>
+      <label className="auth-field"><span>密码</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" disabled={!configured || submitting} /></label>
+      {error && <div className="error-box" role="alert"><strong>{error}</strong></div>}
+      <button className="primary-button auth-submit" type="submit" disabled={!configured || submitting || !username.trim() || !password}>
+        {submitting ? <Loader2 className="spin" size={17} /> : <LockKeyhole size={17} />}
+        {submitting ? "正在登录" : "登录"}
+      </button>
+    </form>
+  </div>;
+}
+
+function App({ user, onLogout }: { user: AuthUser; onLogout: () => void }) {
+  const [activeKey, setActiveKey] = useState<ModuleKey>(() => readNavigationState(window.location.search).module);
   const activeModule = modules.find((item) => item.key === activeKey) ?? modules[0];
+
+  useEffect(() => {
+    const restore = () => setActiveKey(readNavigationState(window.location.search).module);
+    window.addEventListener("popstate", restore);
+    return () => window.removeEventListener("popstate", restore);
+  }, []);
+
+  function chooseModule(key: ModuleKey) {
+    setActiveKey(key);
+    updateNavigationState({ module: key });
+  }
 
   return (
     <div className="app-shell">
@@ -284,6 +407,9 @@ function App() {
             <div className="brand-title">Ideact 内容营销后台</div>
             <div className="brand-subtitle">Content Marketing OS</div>
           </div>
+          <button className="logout-button" type="button" aria-label={`退出登录（${user.username}）`} title={`退出登录（${user.username}）`} onClick={onLogout}>
+            <LogOut size={17} />
+          </button>
         </div>
 
         <nav className="primary-nav">
@@ -296,7 +422,7 @@ function App() {
                 key={item.key}
                 type="button"
                 aria-current={isActive ? "page" : undefined}
-                onClick={() => setActiveKey(item.key)}
+                onClick={() => chooseModule(item.key)}
               >
                 <Icon size={18} strokeWidth={2.1} />
                 <span>{item.label}</span>
@@ -307,21 +433,14 @@ function App() {
       </aside>
 
       <main className="workspace">
-        <header className="topbar">
+        {activeKey !== "overview" && <header className="topbar">
           <div>
             <p className="section-label">当前模块</p>
             <h1>{activeModule.label}</h1>
           </div>
-          <div className="topbar-actions" aria-label="顶部工具">
-            <button className="icon-button" type="button" aria-label="搜索">
-              <Search size={18} strokeWidth={2.1} />
-            </button>
-            <button className="icon-button" type="button" aria-label="通知">
-              <Bell size={18} strokeWidth={2.1} />
-            </button>
-          </div>
-        </header>
+        </header>}
 
+        {activeKey === "overview" && <OperationsOverview />}
         {activeKey === "knowledge" && <KnowledgePage />}
         {activeKey === "pipeline" && <SocialContentPage />}
         {activeKey === "phone" && <PhoneModule />}
@@ -347,22 +466,31 @@ function PlaceholderPanel({ activeModule }: { activeModule: ModuleItem }) {
 }
 
 function PhoneModule() {
-  const [tab, setTab] = useState<"control" | "publish">("control");
+  const [tab, setTab] = useState<PhoneTab>(() => readNavigationState(window.location.search).phoneTab);
   const [monitoredPublish, setMonitoredPublish] = useState<{ id: string; deviceId: string } | null>(() => readJson("ideact:monitoredPublish", null));
+  useEffect(() => {
+    const restore = () => setTab(readNavigationState(window.location.search).phoneTab);
+    window.addEventListener("popstate", restore);
+    return () => window.removeEventListener("popstate", restore);
+  }, []);
   useEffect(() => {
     if (monitoredPublish) localStorage.setItem("ideact:monitoredPublish", JSON.stringify(monitoredPublish));
     else localStorage.removeItem("ideact:monitoredPublish");
   }, [monitoredPublish]);
+  function chooseTab(next: PhoneTab) {
+    setTab(next);
+    updateNavigationState({ module: "phone", phoneTab: next });
+  }
   return (
     <div className="phone-module">
       <div className="phone-module-tabs" role="tablist" aria-label="云手机发布功能">
-        <button className={`choice-chip${tab === "control" ? " is-selected" : ""}`} type="button" role="tab" aria-selected={tab === "control"} onClick={() => setTab("control")}>操控中心</button>
-        <button className={`choice-chip${tab === "publish" ? " is-selected" : ""}`} type="button" role="tab" aria-selected={tab === "publish"} onClick={() => setTab("publish")}>发布内容</button>
+        <button className={`choice-chip${tab === "control" ? " is-selected" : ""}`} type="button" role="tab" aria-selected={tab === "control"} onClick={() => chooseTab("control")}>操控中心</button>
+        <button className={`choice-chip${tab === "publish" ? " is-selected" : ""}`} type="button" role="tab" aria-selected={tab === "publish"} onClick={() => chooseTab("publish")}>发布内容</button>
       </div>
       <div hidden={tab !== "control"}><CloudPhoneControlCenter monitoredPublish={monitoredPublish} onStopMonitoring={() => setMonitoredPublish(null)} /></div>
       {tab === "publish" && <PublishContentPage onSubmitted={(job) => {
         setMonitoredPublish(job);
-        setTab("control");
+        chooseTab("control");
         window.scrollTo({ top: 0, behavior: "smooth" });
       }} />}
     </div>
@@ -416,6 +544,40 @@ function isAiControlling(status: CloudPhoneTaskView["status"]) {
   return ["PENDING", "RUNNING", "PAUSING", "CANCELLING"].includes(status);
 }
 
+function AgentTaskPanel({ task, onAction, onRefresh }: {
+  task: CloudPhoneTaskView;
+  onAction: (action: "pause" | "resume" | "cancel") => void;
+  onRefresh: () => void;
+}) {
+  const content = (
+    <div className="agent-message-thread" aria-live="polite">
+      <div className="agent-user-message"><strong>用户指令</strong><p>{task.instruction}</p></div>
+      <div className="agent-status-message">
+        <div className="agent-status-line">
+          {isAiControlling(task.status) && <Loader2 className="spin" size={16} />}
+          <strong>{agentTaskStatusLabel(task.status)}</strong>
+          <span>任务编号：{task.providerTaskId || task.id}</span>
+        </div>
+        {task.result && <p>{task.result}</p>}
+        {task.errorMessage && <p>{task.errorMessage}</p>}
+        <div className="agent-task-meta">
+          <span>执行步数：{task.steps || "-"}</span>
+          <span>耗时：{task.duration ? `${task.duration} 秒` : "-"}</span>
+          <span>更新时间：{formatDateTime(task.updatedAt)}</span>
+        </div>
+        <div className="agent-task-actions">
+          {!isTaskTerminal(task.status) && !["PAUSED", "CALL_FOR_USER"].includes(task.status) && <button className="secondary-button" type="button" onClick={() => onAction("pause")}>暂停并人工接管</button>}
+          {["PAUSED", "CALL_FOR_USER"].includes(task.status) && <button className="primary-button" type="button" onClick={() => onAction("resume")}>交还 AI 继续执行</button>}
+          {!isTaskTerminal(task.status) && <button className="secondary-button" type="button" onClick={() => onAction("cancel")}>结束任务</button>}
+          <button className="secondary-button" type="button" onClick={onRefresh}>刷新状态</button>
+        </div>
+      </div>
+    </div>
+  );
+  if (!isTaskTerminal(task.status)) return content;
+  return <details className="agent-terminal-task"><summary><span>上次任务</span><strong>{agentTaskStatusLabel(task.status)}</strong><small>{formatDateTime(task.updatedAt)}</small></summary>{content}</details>;
+}
+
 function normalizeUiError(error: unknown, fallbackSuggestions: string[] = []) {
   if (error && typeof error === "object") {
     const record = error as { message?: string; suggestions?: string[]; error?: { message?: string } };
@@ -440,12 +602,16 @@ type MonitoredPublishJob = {
   channel: string;
   status: "SCHEDULED" | "QUEUED" | "PREPARING" | "RUNNING" | "REVIEW_REQUIRED" | "PUBLISHED" | "FAILED" | "CANCELED";
   scheduledAt?: string | null;
-  imageTransfer?: { image: number; totalImages: number; completed: number; total: number };
+  createdAt?: string;
+  imageTransfer?: { image: number; totalImages: number; completed: number; total: number; mode?: "direct-url" };
   errorMessage?: string;
+  syncWarning?: string;
   providerResult?: string;
   providerTaskId?: string;
+  providerStartedAt?: string;
   providerSteps?: string;
   providerDuration?: string;
+  progressEvents?: PublishProgressEvent[];
 };
 
 const publishStatusText: Record<MonitoredPublishJob["status"], string> = {
@@ -471,6 +637,7 @@ function CloudPhoneControlCenter({ monitoredPublish, onStopMonitoring }: { monit
   const screenTimeoutRef = useRef<number | null>(null);
   const selectedDevice = devices.find((item) => item.id === selectedDeviceId) ?? devices[0];
   const publishingControlsPhone = Boolean(publishJob && ["QUEUED", "PREPARING", "RUNNING"].includes(publishJob.status) && publishJob.deviceId === selectedDevice?.id);
+  const publishFeedback = publishJob?.providerResult ? summarizeProviderResult(publishJob.providerResult) : null;
 
   useEffect(() => {
     if (!monitoredPublish) { setPublishJob(null); setPublishError(""); return; }
@@ -846,7 +1013,7 @@ function CloudPhoneControlCenter({ monitoredPublish, onStopMonitoring }: { monit
                 </div>
                 <div>
                   <dt>过期时间</dt>
-                  <dd>{selectedDevice.expireTime || "阿里云未返回"}</dd>
+                  <dd>{selectedDevice.expireTime ? formatDateTime(selectedDevice.expireTime) : "阿里云未返回"}</dd>
                 </div>
               </dl>
             )}
@@ -881,11 +1048,13 @@ function CloudPhoneControlCenter({ monitoredPublish, onStopMonitoring }: { monit
             </div>
             <p>任务编号：{monitoredPublish.id}</p>
             {publishJob?.status === "SCHEDULED" && <p>计划时间：{formatDateTime(publishJob.scheduledAt || undefined)}。画面仅显示当前设备，不代表已经开始发布。</p>}
-            {publishJob?.status === "PREPARING" && publishJob.imageTransfer && <p>图片传输：第 {publishJob.imageTransfer.image}/{publishJob.imageTransfer.totalImages} 张，{Math.floor(publishJob.imageTransfer.completed / publishJob.imageTransfer.total * 100)}%</p>}
+            {publishJob?.status === "PREPARING" && publishJob.imageTransfer && <p>{publishJob.imageTransfer.mode === "direct-url" ? `图片整图直传：已完成 ${publishJob.imageTransfer.completed}/${publishJob.imageTransfer.totalImages} 张` : `图片传输：第 ${publishJob.imageTransfer.image}/${publishJob.imageTransfer.totalImages} 张，${Math.floor(publishJob.imageTransfer.completed / publishJob.imageTransfer.total * 100)}%`}</p>}
             {publishJob?.providerTaskId && <p>阿里云任务：{publishJob.providerTaskId}</p>}
             {publishJob?.providerSteps !== undefined && <p>已执行步骤：{publishJob.providerSteps}{publishJob.providerDuration !== undefined ? ` · 耗时 ${publishJob.providerDuration} 秒` : ""}</p>}
             {publishJob?.status === "REVIEW_REQUIRED" && <p>AI 已结束。请在平台核实帖子是否真的发布，再到“发布内容”确认记录。</p>}
-            {publishJob?.providerResult && <p>{publishJob.providerResult}</p>}
+            {publishFeedback && <p>{publishFeedback.summary}{publishFeedback.steps ? ` · ${publishFeedback.steps} 步` : ""}</p>}
+            {publishJob && <PublishExecutionProgress job={publishJob} />}
+            {publishJob?.syncWarning && <p className="publish-job-warning">{publishJob.syncWarning}</p>}
             {publishJob?.errorMessage && <p className="publish-job-error">{publishJob.errorMessage}</p>}
             {publishError && <p className="publish-job-error">{publishError} 请到“发布内容”查看记录或稍后重试刷新。</p>}
             {status === "error" && <p className="publish-job-error">实时画面连接失败，请在左侧重新连接；发布任务状态仍以本区显示的服务端记录为准。</p>}
@@ -925,40 +1094,7 @@ function CloudPhoneControlCenter({ monitoredPublish, onStopMonitoring }: { monit
               {activeTask && <StatusPill tone={isTaskTerminal(activeTask.status) ? activeTask.status === "COMPLETED" ? "ok" : "warn" : "idle"}>{agentTaskStatusLabel(activeTask.status)}</StatusPill>}
             </div>
 
-            {activeTask && (
-              <div className="agent-message-thread" aria-live="polite">
-                <div className="agent-user-message">
-                  <strong>用户指令</strong>
-                  <p>{activeTask.instruction}</p>
-                </div>
-                <div className="agent-status-message">
-                  <div className="agent-status-line">
-                    {isAiControlling(activeTask.status) && <Loader2 className="spin" size={16} />}
-                    <strong>{agentTaskStatusLabel(activeTask.status)}</strong>
-                    <span>任务编号：{activeTask.providerTaskId || activeTask.id}</span>
-                  </div>
-                  {activeTask.result && <p>{activeTask.result}</p>}
-                  {activeTask.errorMessage && <p>{activeTask.errorMessage}</p>}
-                  <div className="agent-task-meta">
-                    <span>执行步数：{activeTask.steps || "-"}</span>
-                    <span>耗时：{activeTask.duration ? `${activeTask.duration} 秒` : "-"}</span>
-                    <span>更新时间：{formatDateTime(activeTask.updatedAt)}</span>
-                  </div>
-                  <div className="agent-task-actions">
-                    {!isTaskTerminal(activeTask.status) && !["PAUSED", "CALL_FOR_USER"].includes(activeTask.status) && (
-                      <button className="secondary-button" type="button" onClick={() => changeAgentTask("pause")}>暂停并人工接管</button>
-                    )}
-                    {["PAUSED", "CALL_FOR_USER"].includes(activeTask.status) && (
-                      <button className="primary-button" type="button" onClick={() => changeAgentTask("resume")}>交还 AI 继续执行</button>
-                    )}
-                    {!isTaskTerminal(activeTask.status) && (
-                      <button className="secondary-button" type="button" onClick={() => changeAgentTask("cancel")}>结束任务</button>
-                    )}
-                    <button className="secondary-button" type="button" onClick={() => refreshTask()}>刷新状态</button>
-                  </div>
-                </div>
-              </div>
-            )}
+            {activeTask && <AgentTaskPanel task={activeTask} onAction={changeAgentTask} onRefresh={() => refreshTask()} />}
 
             <label className="agent-command-input">
               <span>输入指令</span>
@@ -971,7 +1107,7 @@ function CloudPhoneControlCenter({ monitoredPublish, onStopMonitoring }: { monit
               />
             </label>
             <div className="agent-command-footer">
-              <p>{connection ? "当前任务结束后才能发送下一条指令。AI 操作期间会暂时关闭人工鼠标输入。" : "请先连接云手机，再发送自然语言指令。"}</p>
+              <p>{!connection ? "请先连接云手机，再发送自然语言指令。" : activeTask && !isTaskTerminal(activeTask.status) ? "当前任务结束后才能发送下一条指令。AI 操作期间会暂时关闭人工鼠标输入。" : "输入新的指令后即可开始任务；发送后会暂时关闭人工鼠标输入。"}</p>
               <button className="primary-button" type="submit" disabled={!connection || publishingControlsPhone || !instruction.trim() || isSubmittingTask || Boolean(activeTask && !isTaskTerminal(activeTask.status))}>
                 {isSubmittingTask ? <Loader2 className="spin" size={16} /> : <Send size={16} />}
                 发送指令
@@ -988,6 +1124,40 @@ function CloudPhoneControlCenter({ monitoredPublish, onStopMonitoring }: { monit
       </div>
     </section>
   );
+}
+
+function PublishExecutionProgress({ job }: { job: MonitoredPublishJob }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (job.status !== "RUNNING") return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [job.status]);
+  const progress = buildPublishProgressView(job, now);
+  const statusText = publishStatusText[job.status];
+  const resultSteps = job.providerResult ? summarizeProviderResult(job.providerResult).steps : undefined;
+  const reportedSteps = job.providerSteps || resultSteps;
+  const stepText = reportedSteps ? `已执行 ${reportedSteps} 步` : job.status === "RUNNING" ? "正在等待步数" : "未返回步数";
+
+  return <section className="publish-execution-progress" aria-label="发布任务执行进度">
+    <div className="publish-progress-head">
+      <div><strong>{progress.current.title}</strong><span>第 {progress.currentNumber}/{progress.total} 阶段 · {statusText}</span></div>
+      <strong>{progress.percent}%</strong>
+    </div>
+    <div className="publish-progress-track" role="progressbar" aria-label="发布总体进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress.percent}>
+      <span style={{ width: `${progress.percent}%` }} />
+    </div>
+    <div className="publish-progress-metrics">
+      <span>当前：{progress.current.detail}</span><span>{stepText}</span><span>用时 {formatElapsed(progress.elapsedSeconds)}</span>
+    </div>
+    <ol className="publish-progress-timeline">
+      {progress.events.map((event, index) => <li className={`is-${event.status}`} key={event.stage}>
+        <span className="publish-progress-dot" aria-hidden="true">{event.status === "completed" ? "✓" : index + 1}</span>
+        <div><strong>{event.title}</strong><p>{event.detail}</p>{event.updatedAt && <time>{formatDateTime(event.updatedAt)}</time>}</div>
+      </li>)}
+    </ol>
+    <p className="publish-progress-note">阿里云接口实时返回任务状态和已执行步数，不返回每次点击的名称；具体操作请同时查看下方实时画面。</p>
+  </section>;
 }
 
 function loadProductionRecords(): ProductionRecord[] {
@@ -1036,7 +1206,9 @@ function SocialContentPage() {
   const [productState, setProductState] = useState<"idle" | "loading" | "success" | "empty" | "error">("idle");
   const [productError, setProductError] = useState<{ message: string; suggestions: string[] } | null>(null);
   const [editingObject, setEditingObject] = useState<CreationObject | null>(null);
-  const [managerOpen, setManagerOpen] = useState(false);
+  const [creationObjectBases, setCreationObjectBases] = useState<KnowledgeBase[]>([]);
+  const [creationObjectBasesState, setCreationObjectBasesState] = useState<"loading" | "ready" | "error">("loading");
+  const [objectNotice, setObjectNotice] = useState("");
   const [topicGroups, setTopicGroups] = useState<TopicGroup[]>(() => readJson("ideact:socialTopicGroups", []));
   const [favorites, setFavorites] = useState<GeneratedTopic[]>(() => readJson("ideact:socialTopicFavorites", []));
   const [selectedTopicId, setSelectedTopicId] = useState(() => localStorage.getItem("ideact:selectedTopicId") || "");
@@ -1051,8 +1223,8 @@ function SocialContentPage() {
   const [copyError, setCopyError] = useState<{ message: string; suggestions: string[] } | null>(null);
   const [imageResults, setImageResults] = useState<SocialImageResult[]>(() => readJson("ideact:socialImageResults", []));
   const [productionRecords, setProductionRecords] = useState<ProductionRecord[]>(loadProductionRecords);
-  const [showProductionRecords, setShowProductionRecords] = useState(false);
   const [generatingImageKey, setGeneratingImageKey] = useState("");
+  const [imageBatchProgress, setImageBatchProgress] = useState<{ completed: number; failed: number; total: number } | null>(null);
   const [imageError, setImageError] = useState<{ message: string; suggestions: string[] } | null>(null);
   const [imageModels, setImageModels] = useState<ImageModelInfo[]>([]);
   const [visualDirections, setVisualDirections] = useState<Record<string, VisualDirection[]>>(() => readJson("ideact:visualDirections", {}));
@@ -1062,9 +1234,25 @@ function SocialContentPage() {
   const [imageModelId, setImageModelId] = useState("");
   const [isGeneratingDirections, setIsGeneratingDirections] = useState(false);
   const [directionError, setDirectionError] = useState<{ message: string; suggestions: string[] } | null>(null);
-  const [activeWorkflowStep, setActiveWorkflowStep] = useState<WorkflowStepNumber>(1);
+  const [activeWorkflowStep, setActiveWorkflowStep] = useState<WorkflowStepNumber>(() => readNavigationState(window.location.search).step);
+  const [confirmedStepOneKey, setConfirmedStepOneKey] = useState(() => localStorage.getItem("ideact:confirmedStepOneKey") || "");
+  const [confirmedCopyKey, setConfirmedCopyKey] = useState(() => localStorage.getItem("ideact:confirmedCopyKey") || "");
+  const [modelStatus, setModelStatus] = useState<ModelConfigurationStatus | null>(null);
+  const [modelStatusState, setModelStatusState] = useState<"loading" | "ready" | "error">("loading");
+  const [workspaceSaveError, setWorkspaceSaveError] = useState("");
   const activeTopicRequestKey = useRef("");
   const activeCopyRequestKey = useRef("");
+
+  useEffect(() => {
+    const restore = () => setActiveWorkflowStep(readNavigationState(window.location.search).step);
+    window.addEventListener("popstate", restore);
+    return () => window.removeEventListener("popstate", restore);
+  }, []);
+
+  function chooseWorkflowStep(step: WorkflowStepNumber, mode: "push" | "replace" = "push") {
+    setActiveWorkflowStep(step);
+    updateNavigationState({ module: "pipeline", step }, mode);
+  }
 
   useEffect(() => {
     localStorage.setItem("ideact:userCreationObjects", JSON.stringify(userObjects));
@@ -1107,6 +1295,41 @@ function SocialContentPage() {
   }, [imagePrompts]);
 
   useEffect(() => {
+    if (selectedTopicId) localStorage.setItem("ideact:selectedTopicId", selectedTopicId);
+    else localStorage.removeItem("ideact:selectedTopicId");
+    if (activeCopyKey) localStorage.setItem("ideact:activeCopyKey", activeCopyKey);
+    else localStorage.removeItem("ideact:activeCopyKey");
+    localStorage.setItem("ideact:activeCopyChannel", activeCopyChannel);
+    if (confirmedStepOneKey) localStorage.setItem("ideact:confirmedStepOneKey", confirmedStepOneKey);
+    else localStorage.removeItem("ideact:confirmedStepOneKey");
+    if (confirmedCopyKey) localStorage.setItem("ideact:confirmedCopyKey", confirmedCopyKey);
+    else localStorage.removeItem("ideact:confirmedCopyKey");
+
+    const timer = window.setTimeout(() => {
+      void saveContentWorkspace()
+        .then(() => setWorkspaceSaveError(""))
+        .catch((caught) => setWorkspaceSaveError(caught instanceof Error ? caught.message : "内容自动保存失败。"));
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [
+    userObjects,
+    selection,
+    topicGroups,
+    favorites,
+    briefs,
+    copyResults,
+    imageResults,
+    productionRecords,
+    visualDirections,
+    imagePrompts,
+    selectedTopicId,
+    activeCopyKey,
+    activeCopyChannel,
+    confirmedStepOneKey,
+    confirmedCopyKey,
+  ]);
+
+  useEffect(() => {
     fetch("/api/social/image-models")
       .then((response) => response.json())
       .then((payload) => {
@@ -1115,6 +1338,38 @@ function SocialContentPage() {
         setImageModelId((current) => current || models[0]?.id || "");
       })
       .catch(() => setImageModels([]));
+  }, []);
+
+  useEffect(() => {
+    let ignore = false;
+    setCreationObjectBasesState("loading");
+    fetch("/api/knowledge/bases")
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) throw payload;
+        if (ignore) return;
+        setCreationObjectBases(payload.bases ?? []);
+        setCreationObjectBasesState("ready");
+      })
+      .catch(() => {
+        if (!ignore) setCreationObjectBasesState("error");
+      });
+    return () => { ignore = true; };
+  }, []);
+
+  useEffect(() => {
+    setModelStatusState("loading");
+    fetch("/api/social/model-status")
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) throw payload;
+        setModelStatus(payload);
+        setModelStatusState("ready");
+      })
+      .catch(() => {
+        setModelStatus(null);
+        setModelStatusState("error");
+      });
   }, []);
 
   useEffect(() => {
@@ -1169,26 +1424,19 @@ function SocialContentPage() {
   }
 
   function saveObject(nextObject: CreationObject) {
-    const normalized = {
-      ...nextObject,
-      name: nextObject.name.trim(),
-      positioning: nextObject.positioning.trim(),
-      contentStyle: nextObject.contentStyle.trim(),
-      knowledgeBaseName: nextObject.knowledgeBaseName.trim() || nextObject.knowledgeBaseId,
-    };
-    if (!normalized.name) return;
-    setUserObjects((current) => {
-      const exists = current.some((item) => item.id === normalized.id);
-      return exists ? current.map((item) => (item.id === normalized.id ? normalized : item)) : [...current, normalized];
-    });
+    const normalized = normalizeCreationObject(nextObject);
+    setUserObjects((current) => upsertCreationObject(current, normalized));
     setSelection({ objectId: normalized.id, promoteProduct: false, product: null });
     setEditingObject(null);
-    setManagerOpen(false);
+    setObjectNotice(`已保存创作对象“${normalized.name}”。`);
   }
 
   function deleteObject(objectId: string) {
+    const target = userObjects.find((item) => item.id === objectId);
+    if (!target || !window.confirm(`将删除创作对象“${target.name}”，删除后无法恢复。是否继续？`)) return;
     setUserObjects((current) => current.filter((item) => item.id !== objectId));
     if (selection.objectId === objectId) setSelection({ objectId: "brand-cat", promoteProduct: false, product: null });
+    setObjectNotice(`已删除创作对象“${target.name}”。`);
   }
 
   const filteredProducts = products.filter((product) => fuzzyMatchProduct(product, productQuery));
@@ -1198,13 +1446,61 @@ function SocialContentPage() {
   const briefKey = selectedObject && selectedTopic ? buildBriefKey(selectedObject.id, selectedTopic.id, selection.promoteProduct ? selection.product?.id || null : null) : "";
   const currentBrief = briefs.find((brief) => brief.key === briefKey);
   const currentCopyResult = activeCopyKey ? copyResults.find((result) => result.key === activeCopyKey) : undefined;
+  const currentVisualDirections = currentCopyResult ? visualDirections[currentCopyResult.key] ?? [] : [];
+  const stepOneKey = selectedObject ? JSON.stringify({
+    object: {
+      id: selectedObject.id,
+      name: selectedObject.name,
+      type: selectedObject.type,
+      positioning: selectedObject.positioning,
+      contentStyle: selectedObject.contentStyle,
+      knowledgeBaseId: selectedObject.knowledgeBaseId,
+      topicWeights: selectedObject.topicWeights,
+    },
+    promoteProduct: selection.promoteProduct,
+    productId: selection.promoteProduct ? selection.product?.id || null : null,
+  }) : "";
+  const stepOneComplete = Boolean(stepOneKey && (confirmedStepOneKey === stepOneKey || currentTopicGroup));
+  const stepFourComplete = Boolean(currentCopyResult && confirmedCopyKey === currentCopyResult.key);
+  const textGenerationDisabledReason = modelStatusState === "loading"
+    ? "正在检查文字模型配置"
+    : modelStatusState === "error"
+      ? "文字模型配置状态读取失败"
+      : !modelStatus?.text.configured ? "文字模型未配置" : undefined;
 
   useEffect(() => {
     activeTopicRequestKey.current = resultKey;
   }, [resultKey]);
 
+  useEffect(() => {
+    const copyKey = currentCopyResult?.key;
+    if (!copyKey) return;
+    const recovered = recoverImagePrompt(imagePrompts[copyKey], currentVisualDirections, selectedDirectionId);
+    if (!recovered.prompt) return;
+    setSelectedDirectionId(recovered.directionId);
+    setImagePrompts((current) => current[copyKey]?.trim() ? current : { ...current, [copyKey]: recovered.prompt });
+  }, [currentCopyResult?.key, currentVisualDirections]);
+
+  function confirmStepOne() {
+    if (!stepOneKey) return;
+    setConfirmedStepOneKey(stepOneKey);
+    localStorage.setItem("ideact:confirmedStepOneKey", stepOneKey);
+    chooseWorkflowStep(2);
+  }
+
+  function confirmCopyAndContinue() {
+    if (!currentCopyResult) return;
+    setConfirmedCopyKey(currentCopyResult.key);
+    localStorage.setItem("ideact:confirmedCopyKey", currentCopyResult.key);
+    chooseWorkflowStep(5);
+  }
+
   async function generateTopics(force = false) {
     if (!selectedObject || isGeneratingTopics) return;
+    if (!modelStatus?.text.configured) {
+      setTopicError({ message: "文字模型尚未配置，暂时不能生成选题。", suggestions: ["请在服务端 .env 中填写 DASHSCOPE_API_KEY 并重启 API 服务。"] });
+      return;
+    }
     if (!force && currentTopicGroup) return;
     const requestKey = resultKey;
     activeTopicRequestKey.current = requestKey;
@@ -1242,7 +1538,7 @@ function SocialContentPage() {
         objectName: nextGroup.objectName, productName: nextGroup.productName,
         createdAt: nextGroup.generatedAt, topicGroup: nextGroup, images: [],
       }, ...current]);
-      setActiveWorkflowStep(2);
+      chooseWorkflowStep(2, "replace");
     } catch (caught) {
       setTopicError(readApiError(caught, "选题生成失败。"));
     } finally {
@@ -1267,7 +1563,7 @@ function SocialContentPage() {
       ]);
     }
     localStorage.setItem("ideact:creativeBriefContext", JSON.stringify({ object: selectedObject, selection, topic, generatedAt: currentTopicGroup?.generatedAt, hotspotStatus: currentTopicGroup?.hotspotStatus }));
-    setActiveWorkflowStep(3);
+    chooseWorkflowStep(3);
   }
 
   function updateBrief(nextBrief: CreativeBrief) {
@@ -1276,6 +1572,10 @@ function SocialContentPage() {
 
   async function generateCopyFromBrief(brief: CreativeBrief) {
     if (!selectedObject || !selectedTopic || isGeneratingCopy) return;
+    if (!modelStatus?.text.configured) {
+      setCopyError({ message: "文字模型尚未配置，暂时不能生成渠道文案。", suggestions: ["请在服务端 .env 中填写 DASHSCOPE_API_KEY 并重启 API 服务。"] });
+      return;
+    }
     const requestKey = buildCopyResultKey(selectedObject.id, selectedTopic.id, brief.key, brief.useProduct ? brief.product?.id || null : null, brief.channels);
     activeCopyRequestKey.current = requestKey;
     const confirmed = { ...brief, confirmed: true };
@@ -1314,7 +1614,7 @@ function SocialContentPage() {
       }, ...current]);
       setActiveCopyKey(requestKey);
       setActiveCopyChannel(nextResult.channels[0] || "小红书");
-      setActiveWorkflowStep(4);
+      chooseWorkflowStep(4);
     } catch (caught) {
       setCopyError(readApiError(caught, "文字内容生成失败。"));
     } finally {
@@ -1324,6 +1624,10 @@ function SocialContentPage() {
 
   async function generateVisualDirections() {
     if (!selectedObject || !selectedTopic || !currentBrief || !currentCopyResult || isGeneratingDirections) return;
+    if (!modelStatus?.text.configured) {
+      setDirectionError({ message: "文字模型尚未配置，暂时不能生成视觉方向。", suggestions: ["请在服务端 .env 中填写 DASHSCOPE_API_KEY 并重启 API 服务。"] });
+      return;
+    }
     setIsGeneratingDirections(true);
     setDirectionError(null);
     try {
@@ -1347,43 +1651,72 @@ function SocialContentPage() {
     }
   }
 
-  async function generateImageFromCopy(copy: ChannelCopy, prompt: string, size: ImageSizeOption, directionName: string) {
-    if (!selectedObject || !selectedTopic || !currentBrief || !activeCopyKey || generatingImageKey) return;
-    const imageKey = buildImageResultKey(activeCopyKey, copy.channel, size);
+  async function generateImagesFromCopy(copy: ChannelCopy, prompt: string, sizes: ImageSizeOption[], directionName: string, count: number) {
+    if (!selectedObject || !selectedTopic || !currentBrief || !activeCopyKey || generatingImageKey || sizes.length === 0) return;
+    if (!modelStatus?.image.configured) {
+      setImageError({ message: "图片模型尚未配置，暂时不能生成图片。", suggestions: ["请在服务端 .env 中填写 DASHSCOPE_API_KEY 并重启 API 服务。"] });
+      return;
+    }
+    const total = Math.max(1, Math.min(9, count));
+    const batchId = crypto.randomUUID();
+    const requests = Array.from({ length: total }, (_, index) => ({ index, size: sizes[index % sizes.length] }));
     const recordCopy = currentCopyResult;
-    setGeneratingImageKey(imageKey);
+    let cursor = 0;
+    let completed = 0;
+    const failures: string[] = [];
+    setGeneratingImageKey(batchId);
+    setImageBatchProgress({ completed: 0, failed: 0, total });
     setImageError(null);
     try {
-      const response = await fetch("/api/social/images/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          context: { object: selectedObject, topic: selectedTopic, brief: currentBrief },
-          copy,
-          prompt,
-          directionName,
-          size: imageSizeToPixels(size),
-        }),
-      });
-      const payload = await response.json();
-      if (!response.ok) throw payload;
-      const nextResult: SocialImageResult = {
-        key: imageKey,
-        copyKey: activeCopyKey,
-        channel: copy.channel,
-        generatedAt: payload.generatedAt,
-        taskId: payload.taskId,
-        elapsedMs: payload.elapsedMs,
-        prompt,
-        directionName,
-        size,
-        model: imageModelId || "qwen-image-plus",
-        images: payload.images ?? [],
+      const worker = async () => {
+        while (cursor < requests.length) {
+          const request = requests[cursor];
+          cursor += 1;
+          try {
+            const response = await fetch("/api/social/images/generate", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                context: { object: selectedObject, topic: selectedTopic, brief: currentBrief },
+                copy,
+                prompt,
+                directionName,
+                size: imageSizeToPixels(request.size),
+              }),
+            });
+            const payload = await response.json();
+            if (!response.ok) throw payload;
+            const imageKey = buildImageResultKey(activeCopyKey, copy.channel, request.size, `${batchId}-${request.index + 1}`);
+            const nextResult: SocialImageResult = {
+              key: imageKey,
+              copyKey: activeCopyKey,
+              channel: copy.channel,
+              generatedAt: payload.generatedAt,
+              taskId: payload.taskId,
+              elapsedMs: payload.elapsedMs,
+              prompt,
+              directionName,
+              size: request.size,
+              model: imageModelId || "qwen-image-plus",
+              images: payload.images ?? [],
+            };
+            setImageResults((current) => [nextResult, ...current]);
+            if (recordCopy) setProductionRecords((current) => appendImageToRecord(current, recordCopy.key, recordCopy.generatedAt, nextResult));
+          } catch (caught) {
+            failures.push(readApiError(caught, `第 ${request.index + 1} 张图片生成失败。`).message);
+          } finally {
+            completed += 1;
+            setImageBatchProgress({ completed, failed: failures.length, total });
+          }
+        }
       };
-      setImageResults((current) => [nextResult, ...current.filter((item) => item.key !== imageKey)]);
-      if (recordCopy) setProductionRecords((current) => appendImageToRecord(current, recordCopy.key, recordCopy.generatedAt, nextResult));
-    } catch (caught) {
-      setImageError(readApiError(caught, "图片生成失败。"));
+      await Promise.all(Array.from({ length: Math.min(3, total) }, worker));
+      if (failures.length > 0) {
+        setImageError({
+          message: `${total} 张图片中有 ${failures.length} 张生成失败，已保留其余成功图片。`,
+          suggestions: [failures[0], "如需补齐，请手动再次生成；系统不会自动重试扣费。"],
+        });
+      }
     } finally {
       setGeneratingImageKey("");
     }
@@ -1395,27 +1728,28 @@ function SocialContentPage() {
         <WorkflowOutline
           activeStep={activeWorkflowStep}
           completedSteps={{
-            1: Boolean(selectedObject),
-            2: Boolean(currentTopicGroup),
-            3: Boolean(currentBrief?.confirmed),
-            4: Boolean(currentCopyResult),
+            1: stepOneComplete,
+            2: Boolean(selectedTopic && currentBrief),
+            3: Boolean(currentCopyResult),
+            4: stepFourComplete,
             5: imageResults.some((item) => item.copyKey === activeCopyKey),
           }}
-          onStepChange={(step) => { setShowProductionRecords(false); setActiveWorkflowStep(step); }}
+          availableSteps={{
+            1: true,
+            2: stepOneComplete,
+            3: Boolean(selectedTopic && currentBrief),
+            4: Boolean(currentCopyResult),
+            5: stepFourComplete,
+          }}
+          onStepChange={(step) => chooseWorkflowStep(step)}
         />
 
-        <div className="production-records-toolbar">
-          <button className={`secondary-button${showProductionRecords ? " is-selected" : ""}`} type="button" onClick={() => setShowProductionRecords((value) => !value)}>
-            <Save size={16} /> {showProductionRecords ? "返回当前创作" : `创作记录（${productionRecords.length}）`}
-          </button>
-        </div>
+        <ModelStatusPanel status={modelStatus} state={modelStatusState} />
 
-        {showProductionRecords ? (
-          <ProductionRecordsPanel records={productionRecords} onDelete={(id) => {
-            if (!window.confirm("确定删除这条创作记录吗？删除后无法恢复。")) return;
-            setProductionRecords((current) => deleteProductionRecord(current, id));
-          }} />
-        ) : (<>
+        {workspaceSaveError && <div className="model-status-panel is-error" role="alert">
+          <AlertTriangle size={18} />
+          <div><strong>内容自动保存失败</strong><p>{workspaceSaveError} 当前页面内容仍保留在本机，请确认 API 服务正常后继续编辑。</p></div>
+        </div>}
 
         {activeWorkflowStep === 1 && (
           <>
@@ -1424,10 +1758,12 @@ function SocialContentPage() {
                 <h2>社媒内容 · 选择创作对象</h2>
                 <p>先确定这次代表谁发声，再进入后续选题与内容生成。</p>
               </div>
-              <button className="secondary-button" type="button" onClick={() => { setEditingObject(createEmptyUserObject()); setManagerOpen(true); }}>
+              <button className="secondary-button" type="button" onClick={() => setEditingObject(createEmptyUserObject())}>
                 <Plus size={16} /> 新建对象
               </button>
             </div>
+
+            {objectNotice && <div className="inline-success" role="status"><CheckCircle2 size={16} />{objectNotice}</div>}
 
             <div className="object-grid">
               {objects.map((object) => (
@@ -1436,7 +1772,7 @@ function SocialContentPage() {
                   object={object}
                   selected={object.id === selectedObject?.id}
                   onSelect={() => chooseObject(object)}
-                  onEdit={() => { setEditingObject(object); setManagerOpen(true); }}
+                  onEdit={() => setEditingObject(object)}
                   onDelete={!object.builtIn ? () => deleteObject(object.id) : undefined}
                 />
               ))}
@@ -1489,6 +1825,15 @@ function SocialContentPage() {
             ) : (
               <StateBlock icon={AlertTriangle} title="暂无创作对象" text="请先新建一个创作对象。" tone="warning" />
             )}
+
+            <StepAdvanceBar
+              title={stepOneComplete ? "第 1 步已完成" : "确认本次创作配置"}
+              text={selectedObject ? `创作对象：${selectedObject.name} · ${selection.promoteProduct && selection.product ? `推广产品：${selection.product.name}` : "不指定具体产品"}` : "请选择或新建一个创作对象。"}
+              actionLabel="确认配置，进入生成选题"
+              onAction={confirmStepOne}
+              ready={Boolean(selectedObject && (!selection.promoteProduct || selection.product))}
+              blockedText="请选择创作对象，并确认是否推广具体产品。"
+            />
           </>
         )}
 
@@ -1505,6 +1850,7 @@ function SocialContentPage() {
             onToggleFavorite={toggleFavorite}
             onStart={startBrief}
             selectedTopicId={selectedTopicId}
+            disabledReason={textGenerationDisabledReason}
           />
         )}
         {activeWorkflowStep === 2 && !selectedObject && <StateBlock icon={AlertTriangle} title="请先选择创作对象" text="第 2 步生成选题需要先完成第 1 步。" tone="warning" />}
@@ -1524,9 +1870,10 @@ function SocialContentPage() {
             onBack={() => {
               setSelectedTopicId("");
               localStorage.removeItem("ideact:selectedTopicId");
-              setActiveWorkflowStep(2);
+              chooseWorkflowStep(2);
             }}
             onReloadProducts={() => loadProducts(selectedObject)}
+            generationDisabledReason={textGenerationDisabledReason}
           />
         )}
         {activeWorkflowStep === 3 && (!selectedObject || !selectedTopic || !currentBrief) && <StateBlock icon={FileText} title="请先选择一个选题" text="第 3 步创作简报需要从选题卡点击“开始创作”。" tone="empty" />}
@@ -1540,7 +1887,7 @@ function SocialContentPage() {
             activeChannel={activeCopyChannel}
             imageResults={imageResults}
             imageModels={imageModels}
-            visualDirections={visualDirections[currentCopyResult.key] ?? []}
+            visualDirections={currentVisualDirections}
             promptDraft={imagePrompts[currentCopyResult.key] || ""}
             selectedDirectionId={selectedDirectionId}
             selectedImageSizes={selectedImageSizes}
@@ -1548,6 +1895,7 @@ function SocialContentPage() {
             isGeneratingDirections={isGeneratingDirections}
             directionError={directionError}
             generatingImageKey={generatingImageKey}
+            imageBatchProgress={imageBatchProgress}
             imageError={imageError}
             onChannelChange={setActiveCopyChannel}
             onGenerateDirections={generateVisualDirections}
@@ -1559,17 +1907,24 @@ function SocialContentPage() {
             onPromptChange={(prompt) => setImagePrompts((current) => ({ ...current, [currentCopyResult.key]: prompt }))}
             onSizesChange={setSelectedImageSizes}
             onModelChange={setImageModelId}
-            onGenerateImage={generateImageFromCopy}
+            onGenerateImage={generateImagesFromCopy}
+            textModelConfigured={Boolean(modelStatus?.text.configured)}
+            onContinueToImages={confirmCopyAndContinue}
             onBackToBrief={() => {
               setActiveCopyKey("");
               localStorage.removeItem("ideact:activeCopyKey");
-              setActiveWorkflowStep(3);
+              chooseWorkflowStep(3);
             }}
           />
         )}
         {activeWorkflowStep === 4 && (!selectedObject || !selectedTopic || !currentCopyResult) && <StateBlock icon={FileText} title="还没有文字定稿" text="请先在第 3 步创作简报中生成所选渠道文字内容。" tone="empty" />}
         {activeWorkflowStep === 5 && (!selectedObject || !selectedTopic || !currentCopyResult) && <StateBlock icon={Sparkles} title="还不能制作图片" text="图片制作需要先完成第 4 步文字定稿，并读取最终渠道文案。" tone="empty" />}
-        </>)}
+
+        <ProductionRecordsPanel records={productionRecords} onDelete={(record) => {
+          const label = record.topic?.title || `${record.objectName}${record.kind === "topics" ? "选题" : "内容"}`;
+          if (!window.confirm(`将删除创作记录“${label}”，删除后无法恢复。是否继续？`)) return;
+          setProductionRecords((current) => deleteProductionRecord(current, record.id));
+        }} />
       </main>
 
       <aside className="social-side">
@@ -1578,7 +1933,7 @@ function SocialContentPage() {
             <h2>当前选择</h2>
             <p>下一步生成选题会读取这些信息</p>
           </div>
-          <button className="small-icon-button" type="button" aria-label="对象管理" onClick={() => setManagerOpen((value) => !value)}>
+          <button className="small-icon-button" type="button" aria-label="编辑当前创作对象" onClick={() => selectedObject && setEditingObject(selectedObject)} disabled={!selectedObject}>
             <Settings2 size={15} />
           </button>
         </div>
@@ -1617,9 +1972,17 @@ function SocialContentPage() {
             {favorites.length === 0 ? <p className="muted-text">还没有收藏选题。</p> : favorites.map((topic) => <p key={topic.id}>{topic.title}</p>)}
           </div>
         )}
-
-        {managerOpen && editingObject && <ObjectEditor object={editingObject} onCancel={() => setEditingObject(null)} onSave={saveObject} />}
       </aside>
+
+      {editingObject && (
+        <ObjectEditor
+          object={editingObject}
+          knowledgeBases={creationObjectBases}
+          knowledgeBasesState={creationObjectBasesState}
+          onCancel={() => setEditingObject(null)}
+          onSave={saveObject}
+        />
+      )}
     </section>
   );
 }
@@ -1645,7 +2008,12 @@ function CreationObjectCard({ object, selected, onSelect, onEdit, onDelete }: { 
   );
 }
 
-function WorkflowOutline({ activeStep, completedSteps, onStepChange }: { activeStep: WorkflowStepNumber; completedSteps: Record<number, boolean>; onStepChange: (step: WorkflowStepNumber) => void }) {
+function WorkflowOutline({ activeStep, completedSteps, availableSteps, onStepChange }: {
+  activeStep: WorkflowStepNumber;
+  completedSteps: Record<number, boolean>;
+  availableSteps: Record<number, boolean>;
+  onStepChange: (step: WorkflowStepNumber) => void;
+}) {
   const steps = [
     { number: 1, title: "选择创作对象", text: "确定这次为谁发声" },
     { number: 2, title: "生成选题", text: "产出可收藏的内容方向" },
@@ -1664,18 +2032,26 @@ function WorkflowOutline({ activeStep, completedSteps, onStepChange }: { activeS
         {steps.map((step, index) => {
           const isActive = step.number === activeStep;
           const isDone = completedSteps[step.number];
+          const isAvailable = availableSteps[step.number] || isActive;
+          const statusLabel = isDone ? "已完成" : isActive ? "进行中" : isAvailable ? "待开始" : "未解锁";
           return (
             <React.Fragment key={step.number}>
               <button
-                className={`workflow-step${isActive ? " is-active" : ""}${isDone ? " is-done" : ""}`}
+                className={`workflow-step${isActive ? " is-active" : ""}${isDone ? " is-done" : ""}${!isAvailable ? " is-locked" : ""}`}
                 type="button"
                 role="tab"
                 aria-selected={isActive}
+                aria-disabled={!isAvailable}
+                disabled={!isAvailable}
                 onClick={() => onStepChange(step.number as WorkflowStepNumber)}
               >
-                <span>{step.number}</span>
+                <span className="workflow-step-number">{step.number}</span>
                 <strong>{step.title}</strong>
                 <p>{step.text}</p>
+                <span className="workflow-step-status">
+                  {isDone ? <CheckCircle2 size={13} /> : !isAvailable ? <LockKeyhole size={13} /> : null}
+                  {statusLabel}
+                </span>
               </button>
               {index < steps.length - 1 && <div className="workflow-arrow" aria-hidden="true">→</div>}
             </React.Fragment>
@@ -1686,31 +2062,126 @@ function WorkflowOutline({ activeStep, completedSteps, onStepChange }: { activeS
   );
 }
 
-function ObjectEditor({ object, onSave, onCancel }: { object: CreationObject; onSave: (object: CreationObject) => void; onCancel: () => void }) {
+function StepAdvanceBar({ title, text, actionLabel, onAction, ready = true, blockedText }: {
+  title: string;
+  text: string;
+  actionLabel: string;
+  onAction: () => void;
+  ready?: boolean;
+  blockedText?: string;
+}) {
+  return (
+    <section className={`step-advance-bar${ready ? " is-ready" : ""}`} aria-label="下一步操作">
+      <div>
+        <span>下一步</span>
+        <strong>{title}</strong>
+        <p>{ready ? text : blockedText || text}</p>
+      </div>
+      <button className="primary-button" type="button" onClick={onAction} disabled={!ready}>
+        {actionLabel} <ArrowRight size={16} />
+      </button>
+    </section>
+  );
+}
+
+function ModelStatusPanel({ status, state }: { status: ModelConfigurationStatus | null; state: "loading" | "ready" | "error" }) {
+  if (state === "loading") return <div className="model-status-panel is-loading" role="status"><Loader2 className="spin" size={16} /> 正在检查内容模型配置</div>;
+  if (state === "error" || !status) return <div className="model-status-panel is-error" role="alert"><AlertTriangle size={16} /><span><strong>模型配置状态读取失败</strong>请确认本地 API 服务已经启动后刷新页面。</span></div>;
+  const ready = status.text.configured && status.image.configured;
+  return (
+    <div className={`model-status-panel${ready ? " is-ready" : " is-warning"}`} role="status">
+      {ready ? <CheckCircle2 size={16} /> : <AlertTriangle size={16} />}
+      <span>
+        <strong>{ready ? "内容模型已就绪" : "部分内容模型未配置"}</strong>
+        文字模型 {status.text.configured ? `已配置（${status.text.model}）` : "未配置"} · 图片模型 {status.image.configured ? `已配置（${status.image.model}）` : "未配置"}。
+        {!ready && " 请在服务端 .env 中填写 DASHSCOPE_API_KEY 并重启 API 服务。"}
+      </span>
+    </div>
+  );
+}
+
+function ObjectEditor({ object, knowledgeBases, knowledgeBasesState, onSave, onCancel }: {
+  object: CreationObject;
+  knowledgeBases: KnowledgeBase[];
+  knowledgeBasesState: "loading" | "ready" | "error";
+  onSave: (object: CreationObject) => void;
+  onCancel: () => void;
+}) {
   const [draft, setDraft] = useState(object);
+  const [styleSamplesText, setStyleSamplesText] = useState(object.styleSamples.join("\n"));
+  const [bannedExpressionsText, setBannedExpressionsText] = useState(object.bannedExpressions.join("、"));
+  const [errors, setErrors] = useState<ReturnType<typeof validateCreationObject>>({});
   const updateWeight = (key: keyof CreationObject["topicWeights"], value: string) => {
     setDraft((current) => ({ ...current, topicWeights: { ...current.topicWeights, [key]: Math.max(0, Math.min(100, Number(value) || 0)) } }));
   };
+  const knowledgeBaseOptions = knowledgeBases.some((base) => base.id === draft.knowledgeBaseId)
+    ? knowledgeBases
+    : [{ id: draft.knowledgeBaseId, name: draft.knowledgeBaseName, status: "configured" as const, endpoint: "", regionId: "" }, ...knowledgeBases].filter((base) => base.id);
+  const totalWeight = Object.values(draft.topicWeights).reduce((sum, value) => sum + value, 0);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onCancel();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onCancel]);
+
+  function submit(event: React.FormEvent) {
+    event.preventDefault();
+    const next = {
+      ...draft,
+      styleSamples: styleSamplesText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
+      bannedExpressions: bannedExpressionsText.split(/[、,，\r\n]+/).map((item) => item.trim()).filter(Boolean),
+    };
+    const nextErrors = validateCreationObject(next);
+    setErrors(nextErrors);
+    if (Object.keys(nextErrors).length > 0) return;
+    onSave(next);
+  }
 
   return (
-    <form className="object-editor" onSubmit={(event) => { event.preventDefault(); onSave(draft); }}>
-      <h2>{object.name ? "编辑创作对象" : "新建创作对象"}</h2>
-      <label>对象名称<input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required /></label>
-      <label>对象类型<select value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value as CreationObject["type"] })}>{Object.entries(objectTypeLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-      <label>定位<textarea value={draft.positioning} onChange={(event) => setDraft({ ...draft, positioning: event.target.value })} rows={3} /></label>
-      <label>内容风格<textarea value={draft.contentStyle} onChange={(event) => setDraft({ ...draft, contentStyle: event.target.value })} rows={3} /></label>
-      <label>关联知识库 ID<input value={draft.knowledgeBaseId} onChange={(event) => setDraft({ ...draft, knowledgeBaseId: event.target.value })} /></label>
-      <label>关联知识库名称<input value={draft.knowledgeBaseName} onChange={(event) => setDraft({ ...draft, knowledgeBaseName: event.target.value })} /></label>
-      <div className="editor-weights">
-        {Object.entries(draft.topicWeights).map(([key, value]) => (
-          <label key={key}>{weightLabel(key)}<input type="number" min="0" max="100" value={value} onChange={(event) => updateWeight(key as keyof CreationObject["topicWeights"], event.target.value)} /></label>
-        ))}
-      </div>
-      <div className="question-actions">
-        <button className="secondary-button" type="button" onClick={onCancel}>取消</button>
-        <button className="primary-button" type="submit"><Save size={16} /> 保存</button>
-      </div>
-    </form>
+    <div className="object-editor-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onCancel()}>
+      <section className="object-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="object-editor-title">
+        <div className="object-editor-heading">
+          <div><span>创作对象管理</span><h2 id="object-editor-title">{object.name ? "编辑创作对象" : "新建创作对象"}</h2></div>
+          <button className="small-icon-button" type="button" aria-label="关闭编辑器" onClick={onCancel}><X size={17} /></button>
+        </div>
+        <form className="object-editor" onSubmit={submit} noValidate>
+          <label>对象名称 <b>*</b><input autoFocus value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} aria-invalid={Boolean(errors.name)} />{errors.name && <small className="field-error">{errors.name}</small>}</label>
+          <label>对象类型 <b>*</b><select value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value as CreationObject["type"] })}>{Object.entries(objectTypeLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          <label>定位 <b>*</b><textarea value={draft.positioning} onChange={(event) => setDraft({ ...draft, positioning: event.target.value })} rows={3} aria-invalid={Boolean(errors.positioning)} />{errors.positioning && <small className="field-error">{errors.positioning}</small>}</label>
+          <label>内容风格 <b>*</b><textarea value={draft.contentStyle} onChange={(event) => setDraft({ ...draft, contentStyle: event.target.value })} rows={3} aria-invalid={Boolean(errors.contentStyle)} />{errors.contentStyle && <small className="field-error">{errors.contentStyle}</small>}</label>
+          <label>关联知识库 <b>*</b>
+            <select value={draft.knowledgeBaseId} disabled={knowledgeBasesState === "loading"} onChange={(event) => {
+              const base = knowledgeBaseOptions.find((item) => item.id === event.target.value);
+              setDraft({ ...draft, knowledgeBaseId: event.target.value, knowledgeBaseName: base?.name || event.target.value });
+            }} aria-invalid={Boolean(errors.knowledgeBaseId)}>
+              <option value="">请选择知识库</option>
+              {knowledgeBaseOptions.map((base) => <option key={base.id} value={base.id}>{base.name}</option>)}
+            </select>
+            {knowledgeBasesState === "loading" && <small>正在读取已配置知识库…</small>}
+            {knowledgeBasesState === "error" && <small className="field-error">知识库列表读取失败，已保留当前关联；请检查服务后再重试。</small>}
+            {errors.knowledgeBaseId && <small className="field-error">{errors.knowledgeBaseId}</small>}
+          </label>
+          <label>认可的风格样本<textarea value={styleSamplesText} onChange={(event) => setStyleSamplesText(event.target.value)} rows={3} placeholder="每行一条，仅用于学习表达风格" /></label>
+          <label>禁止使用的表达<textarea value={bannedExpressionsText} onChange={(event) => setBannedExpressionsText(event.target.value)} rows={2} placeholder="使用顿号、逗号或换行分隔" /></label>
+          <fieldset className="editor-weight-fieldset">
+            <legend>选题五项权重 <span className={totalWeight === 100 ? "weight-total is-valid" : "weight-total"}>合计 {totalWeight}</span></legend>
+            <div className="editor-weights">
+              {Object.entries(draft.topicWeights).map(([key, value]) => (
+                <label key={key}>{weightLabel(key)}<input type="number" min="0" max="100" value={value} onChange={(event) => updateWeight(key as keyof CreationObject["topicWeights"], event.target.value)} /></label>
+              ))}
+            </div>
+            {errors.topicWeights && <small className="field-error">{errors.topicWeights}</small>}
+          </fieldset>
+          <div className="question-actions object-editor-actions">
+            <button className="secondary-button" type="button" onClick={onCancel}>取消</button>
+            <button className="primary-button" type="submit"><Save size={16} /> 保存对象</button>
+          </div>
+        </form>
+      </section>
+    </div>
   );
 }
 
@@ -1726,6 +2197,7 @@ function TopicGeneratorPanel({
   onToggleFavorite,
   onStart,
   selectedTopicId,
+  disabledReason,
 }: {
   object: CreationObject;
   selection: CreationSelection;
@@ -1738,6 +2210,7 @@ function TopicGeneratorPanel({
   onToggleFavorite: (topic: GeneratedTopic) => void;
   onStart: (topic: GeneratedTopic) => void;
   selectedTopicId: string;
+  disabledReason?: string;
 }) {
   return (
     <section className="topic-panel" aria-labelledby="topic-panel-title">
@@ -1747,14 +2220,19 @@ function TopicGeneratorPanel({
           <p>{object.name} · {selection.promoteProduct && selection.product ? selection.product.name : "不指定具体产品"}</p>
         </div>
         <div className="topic-actions">
-          <button className="secondary-button" type="button" onClick={onGenerate} disabled={isGenerating || Boolean(group)}>
-            <Sparkles size={16} /> 生成选题
-          </button>
-          <button className="primary-button" type="button" onClick={onRegenerate} disabled={isGenerating}>
-            {isGenerating ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />} 重新生成
-          </button>
+          {group ? (
+            <button className="primary-button" type="button" onClick={onRegenerate} disabled={isGenerating || Boolean(disabledReason)} title={disabledReason}>
+              {isGenerating ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />} 重新生成
+            </button>
+          ) : (
+            <button className="primary-button" type="button" onClick={onGenerate} disabled={isGenerating || Boolean(disabledReason)} title={disabledReason}>
+              {isGenerating ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />} 生成选题
+            </button>
+          )}
         </div>
       </div>
+
+      {disabledReason && <div className="inline-error" role="alert"><AlertTriangle size={16} /><span>{disabledReason}。请检查服务端模型配置后刷新页面。</span></div>}
 
       <div className="weights-inline">
         {Object.entries(object.topicWeights).map(([key, value]) => <span key={key}>{weightLabel(key)} {value}</span>)}
@@ -1784,6 +2262,7 @@ function TopicGeneratorPanel({
               />
             ))}
           </div>
+          <div className="step-next-hint"><ArrowRight size={16} /><span>下一步：选择一个选题，点击卡片上的“开始创作”进入创作简报。</span></div>
         </>
       )}
     </section>
@@ -1842,6 +2321,7 @@ function CreativeBriefPanel({
   copyError,
   onBack,
   onReloadProducts,
+  generationDisabledReason,
 }: {
   object: CreationObject;
   topic: GeneratedTopic;
@@ -1855,6 +2335,7 @@ function CreativeBriefPanel({
   copyError: { message: string; suggestions: string[] } | null;
   onBack: () => void;
   onReloadProducts: () => void;
+  generationDisabledReason?: string;
 }) {
   const [productSearch, setProductSearch] = useState("");
   const filteredProducts = products.filter((product) => fuzzyMatchProduct(product, productSearch));
@@ -1966,8 +2447,9 @@ function CreativeBriefPanel({
 
           {copyError && <ErrorBlock message={copyError.message} suggestions={copyError.suggestions} actionLabel="重试生成文字" onAction={() => onGenerateCopy(brief)} />}
           {isGeneratingCopy && <StateBlock icon={Loader2} title="正在生成文字内容" text={`正在为 ${brief.channels.join("、")} 生成首次文案，请勿重复提交。`} tone="loading" />}
-          <button className="primary-button full-width" type="button" disabled={!canContinue || isGeneratingCopy} onClick={() => onGenerateCopy(brief)}>
-            {isGeneratingCopy ? <Loader2 className="spin" size={16} /> : <FileText size={16} />} 生成所选渠道文字内容
+          {generationDisabledReason && <p className="field-warning">{generationDisabledReason}，配置完成后才能生成文字内容。</p>}
+          <button className="primary-button full-width" type="button" disabled={!canContinue || isGeneratingCopy || Boolean(generationDisabledReason)} title={generationDisabledReason} onClick={() => onGenerateCopy(brief)}>
+            {isGeneratingCopy ? <Loader2 className="spin" size={16} /> : <FileText size={16} />} 生成并进入文字定稿
           </button>
           {brief.confirmed && !isGeneratingCopy && <p className="success-note">简报已确认，文字生成会读取完整创作要求。</p>}
         </section>
@@ -1992,6 +2474,7 @@ function CopyFinalizationPanel({
   isGeneratingDirections,
   directionError,
   generatingImageKey,
+  imageBatchProgress,
   imageError,
   onChannelChange,
   onGenerateDirections,
@@ -2001,6 +2484,8 @@ function CopyFinalizationPanel({
   onModelChange,
   onGenerateImage,
   onBackToBrief,
+  onContinueToImages,
+  textModelConfigured,
 }: {
   object: CreationObject;
   topic: GeneratedTopic;
@@ -2017,6 +2502,7 @@ function CopyFinalizationPanel({
   isGeneratingDirections: boolean;
   directionError: { message: string; suggestions: string[] } | null;
   generatingImageKey: string;
+  imageBatchProgress: { completed: number; failed: number; total: number } | null;
   imageError: { message: string; suggestions: string[] } | null;
   onChannelChange: (channel: CopyChannel) => void;
   onGenerateDirections: () => void;
@@ -2024,8 +2510,10 @@ function CopyFinalizationPanel({
   onPromptChange: (prompt: string) => void;
   onSizesChange: (sizes: ImageSizeOption[]) => void;
   onModelChange: (modelId: string) => void;
-  onGenerateImage: (copy: ChannelCopy, prompt: string, size: ImageSizeOption, directionName: string) => void;
+  onGenerateImage: (copy: ChannelCopy, prompt: string, sizes: ImageSizeOption[], directionName: string, count: number) => void;
   onBackToBrief: () => void;
+  onContinueToImages: () => void;
+  textModelConfigured: boolean;
 }) {
   const availableChannels = result.copies.map((copy) => copy.channel) as CopyChannel[];
   const visibleChannel = availableChannels.includes(activeChannel) ? activeChannel : availableChannels[0];
@@ -2065,6 +2553,15 @@ function CopyFinalizationPanel({
 
       {activeCopy ? <CopyPreview copy={activeCopy} /> : <StateBlock icon={FileText} title="暂无可展示文案" text="当前结果没有返回合格的渠道内容，请回到创作简报重试。" tone="empty" />}
 
+      {activeCopy && !showImageProduction && (
+        <StepAdvanceBar
+          title="确认当前文字内容"
+          text={`已生成 ${availableChannels.length} 个渠道版本，确认后进入图片制作。`}
+          actionLabel="确认文字，进入图片制作"
+          onAction={onContinueToImages}
+        />
+      )}
+
       {activeCopy && showImageProduction && (
         <ImageProductionPanel
           object={object}
@@ -2081,6 +2578,7 @@ function CopyFinalizationPanel({
           isGeneratingDirections={isGeneratingDirections}
           directionError={directionError}
           generatingImageKey={generatingImageKey}
+          imageBatchProgress={imageBatchProgress}
           imageError={imageError}
           onGenerateDirections={onGenerateDirections}
           onSelectDirection={onSelectDirection}
@@ -2088,13 +2586,14 @@ function CopyFinalizationPanel({
           onSizesChange={onSizesChange}
           onModelChange={onModelChange}
           onGenerateImage={onGenerateImage}
+          textModelConfigured={textModelConfigured}
         />
       )}
     </section>
   );
 }
 
-function ProductionRecordsPanel({ records, onDelete }: { records: ProductionRecord[]; onDelete: (id: string) => void }) {
+function ProductionRecordsPanel({ records, onDelete }: { records: ProductionRecord[]; onDelete: (record: ProductionRecord) => void }) {
   return (
     <section className="production-records" aria-labelledby="production-records-title">
       <div className="panel-heading social-heading">
@@ -2113,7 +2612,7 @@ function ProductionRecordsPanel({ records, onDelete }: { records: ProductionReco
                   <h3>{record.kind === "topics" ? `${record.objectName} · ${record.topicGroup?.topics.length || 0} 个选题` : record.topic?.title || `${record.objectName}的文案`}</h3>
                   <p>{record.objectName} · {record.productName || "不指定具体产品"}{record.copy ? ` · ${record.copy.channels.join("、")}` : ""}</p>
                 </div>
-                <button className="small-icon-button danger" type="button" aria-label={`删除 ${record.objectName} ${record.kind === "topics" ? "选题" : "内容"}记录`} title="删除记录" onClick={() => onDelete(record.id)}><Trash2 size={16} /></button>
+                <button className="small-icon-button danger" type="button" aria-label={`删除 ${record.objectName} ${record.kind === "topics" ? "选题" : "内容"}记录`} title="删除记录" onClick={() => onDelete(record)}><Trash2 size={16} /></button>
               </div>
               <details className="production-record-details">
                 <summary>查看完整内容 <ChevronDown size={16} /></summary>
@@ -2180,6 +2679,7 @@ function ImageProductionPanel({
   isGeneratingDirections,
   directionError,
   generatingImageKey,
+  imageBatchProgress,
   imageError,
   onGenerateDirections,
   onSelectDirection,
@@ -2187,6 +2687,7 @@ function ImageProductionPanel({
   onSizesChange,
   onModelChange,
   onGenerateImage,
+  textModelConfigured,
 }: {
   object: CreationObject;
   topic: GeneratedTopic;
@@ -2202,17 +2703,31 @@ function ImageProductionPanel({
   isGeneratingDirections: boolean;
   directionError: { message: string; suggestions: string[] } | null;
   generatingImageKey: string;
+  imageBatchProgress: { completed: number; failed: number; total: number } | null;
   imageError: { message: string; suggestions: string[] } | null;
   onGenerateDirections: () => void;
   onSelectDirection: (direction: VisualDirection) => void;
   onPromptChange: (prompt: string) => void;
   onSizesChange: (sizes: ImageSizeOption[]) => void;
   onModelChange: (modelId: string) => void;
-  onGenerateImage: (copy: ChannelCopy, prompt: string, size: ImageSizeOption, directionName: string) => void;
+  onGenerateImage: (copy: ChannelCopy, prompt: string, sizes: ImageSizeOption[], directionName: string, count: number) => void;
+  textModelConfigured: boolean;
 }) {
+  const [generationCount, setGenerationCount] = useState(1);
   const selectedDirection = visualDirections.find((direction) => direction.id === selectedDirectionId) ?? visualDirections[0];
   const activeModel = imageModels.find((model) => model.id === imageModelId);
   const canGenerate = Boolean(promptDraft.trim() && activeModel?.configured && !generatingImageKey);
+  const generationDisabledReason = generatingImageKey
+    ? "图片正在生成，请等待当前批次完成。"
+    : !activeModel
+      ? "请先选择一个生图模型。"
+      : !activeModel.configured
+        ? "当前生图模型未配置。"
+        : !promptDraft.trim()
+          ? "请先生成视觉方向，或在 Prompt 编辑器中填写画面要求。"
+          : selectedImageSizes.length === 0
+            ? "请至少选择一个图片尺寸。"
+            : "";
   const productName = topic.relatedProduct && topic.productName ? topic.productName : "未锁定具体商品";
 
   function toggleSize(size: ImageSizeOption) {
@@ -2221,7 +2736,7 @@ function ImageProductionPanel({
 
   function runGenerate() {
     if (!canGenerate || selectedImageSizes.length === 0) return;
-    selectedImageSizes.forEach((size) => onGenerateImage(copy, promptDraft, size, selectedDirection?.name || "自定义Prompt"));
+    onGenerateImage(copy, promptDraft, selectedImageSizes, selectedDirection?.name || "自定义Prompt", generationCount);
   }
 
   return (
@@ -2250,9 +2765,10 @@ function ImageProductionPanel({
 
         <section className="brief-section">
           <h3>视觉方向建议</h3>
-          <button className="secondary-button full-width" type="button" onClick={onGenerateDirections} disabled={isGeneratingDirections}>
+          <button className="secondary-button full-width" type="button" onClick={onGenerateDirections} disabled={isGeneratingDirections || !textModelConfigured} title={!textModelConfigured ? "文字模型未配置" : undefined}>
             {isGeneratingDirections ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />} 生成视觉方向
           </button>
+          {!textModelConfigured && <p className="field-warning">文字模型未配置，暂时不能生成视觉方向。</p>}
           {directionError && <ErrorBlock message={directionError.message} suggestions={directionError.suggestions} actionLabel="重试方向生成" onAction={onGenerateDirections} />}
           {visualDirections.length === 0 && !isGeneratingDirections && <p className="muted-text">还没有视觉方向。生成前会读取当前定稿文案和创作对象。</p>}
           <div className="direction-list">
@@ -2287,11 +2803,19 @@ function ImageProductionPanel({
           <div className="choice-list">
             {(["4:3", "3:4", "9:16"] as ImageSizeOption[]).map((size) => <button className={`choice-chip${selectedImageSizes.includes(size) ? " is-selected" : ""}`} type="button" key={size} onClick={() => toggleSize(size)}>{size}</button>)}
           </div>
+          <div className="brief-block">
+            <strong>本次生成数量</strong>
+            <div className="choice-list" role="group" aria-label="本次生成图片数量">
+              {[1, 3, 6, 9].map((count) => <button className={`choice-chip${generationCount === count ? " is-selected" : ""}`} type="button" key={count} aria-pressed={generationCount === count} disabled={Boolean(generatingImageKey)} onClick={() => setGenerationCount(count)}>{count} 张</button>)}
+            </div>
+            <p className="muted-text">千问单任务只返回 1 张图；选择 9 张会一次提交 9 个独立任务，最多同时执行 3 个，不会自动重试失败任务。</p>
+          </div>
           {imageError && <ErrorBlock message={imageError.message} suggestions={imageError.suggestions} actionLabel="重试生图" onAction={runGenerate} />}
-          <button className="primary-button full-width" type="button" disabled={!canGenerate || selectedImageSizes.length === 0} onClick={runGenerate}>
-            {generatingImageKey ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />} 根据产品图生成配图
+          {generationDisabledReason && !generatingImageKey && <p className="field-warning" id="image-generation-disabled-reason" role="status">{generationDisabledReason}</p>}
+          <button className="primary-button full-width" type="button" title={generationDisabledReason || undefined} aria-describedby={generationDisabledReason ? "image-generation-disabled-reason" : undefined} disabled={!canGenerate || selectedImageSizes.length === 0} onClick={runGenerate}>
+            {generatingImageKey ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />} {generatingImageKey ? `正在生成 ${imageBatchProgress?.completed || 0}/${imageBatchProgress?.total || generationCount}` : `一次生成 ${generationCount} 张配图`}
           </button>
-          {generatingImageKey && <p className="muted-text">正在生成图片，单张完成后会保存稳定地址。</p>}
+          {generatingImageKey && <p className="muted-text">成功图片会逐张保存到本机。当前失败 {imageBatchProgress?.failed || 0} 张，失败项不会自动重试。</p>}
         </section>
       </div>
 
@@ -2590,8 +3114,8 @@ function buildCopyResultKey(objectId: string, topicId: string, briefKey: string,
   return JSON.stringify({ objectId, topicId, briefKey, productId: productId || "none", channels });
 }
 
-function buildImageResultKey(copyKey: string, channel: string, size: ImageSizeOption) {
-  return JSON.stringify({ copyKey, channel, size });
+function buildImageResultKey(copyKey: string, channel: string, size: ImageSizeOption, variant?: string) {
+  return JSON.stringify({ copyKey, channel, size, variant: variant || "default" });
 }
 
 function imageSizeToPixels(size: ImageSizeOption) {
@@ -2644,4 +3168,7 @@ function formatRelevance(value: number) {
   return value > 1 ? value.toFixed(2) : `${Math.round(value * 100)}%`;
 }
 
-createRoot(document.getElementById("root")!).render(<App />);
+const rootElement = document.getElementById("root")!;
+const appRoot = window.__ideactRoot ?? createRoot(rootElement);
+window.__ideactRoot = appRoot;
+appRoot.render(<AuthGate />);

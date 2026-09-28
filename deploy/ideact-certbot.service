@@ -1,0 +1,6 @@
+[Unit]
+Description=Renew Ideact IP HTTPS certificate
+
+[Service]
+Type=oneshot
+ExecStart=/home/peipei/.local/certbot-venv/bin/certbot renew --quiet --deploy-hook "systemctl reload nginx"

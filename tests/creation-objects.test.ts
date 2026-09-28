@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { extractProductsFromCitations } from "../server/knowledge-utils";
-import { builtInCreationObjects, fuzzyMatchProduct, isProductAllowedForObject, mergeCreationObjects } from "../src/creation-objects";
+import {
+  builtInCreationObjects,
+  fuzzyMatchProduct,
+  isProductAllowedForObject,
+  mergeCreationObjects,
+  normalizeCreationObject,
+  upsertCreationObject,
+  validateCreationObject,
+} from "../src/creation-objects";
 
 describe("creation object selection", () => {
   it("keeps built-in creation objects without user storage", () => {
@@ -13,6 +21,36 @@ describe("creation object selection", () => {
     const objects = mergeCreationObjects([{ ...builtInCreationObjects[0], positioning: "用户修改后的定位", builtIn: false }]);
     expect(objects).toHaveLength(builtInCreationObjects.length);
     expect(objects[0].positioning).toBe("用户修改后的定位");
+  });
+
+  it("creates and updates a persistent user object without duplicates", () => {
+    const created = { ...builtInCreationObjects[0], id: "user-demo", name: "  新对象  ", builtIn: undefined };
+    const stored = upsertCreationObject([], created);
+    const updated = upsertCreationObject(stored, { ...created, name: "更新后的对象" });
+
+    expect(stored[0].name).toBe("新对象");
+    expect(updated).toHaveLength(1);
+    expect(updated[0].name).toBe("更新后的对象");
+  });
+
+  it("validates required fields and requires weights to total 100", () => {
+    const invalid = normalizeCreationObject({
+      ...builtInCreationObjects[0],
+      name: " ",
+      positioning: " ",
+      contentStyle: " ",
+      knowledgeBaseId: " ",
+      topicWeights: { trend: 10, painPoint: 10, product: 10, trust: 10, conversion: 10 },
+    });
+
+    expect(validateCreationObject(invalid)).toEqual(expect.objectContaining({
+      name: expect.any(String),
+      positioning: expect.any(String),
+      contentStyle: expect.any(String),
+      knowledgeBaseId: expect.any(String),
+      topicWeights: expect.any(String),
+    }));
+    expect(validateCreationObject(builtInCreationObjects[0])).toEqual({});
   });
 
   it("supports fuzzy product search", () => {

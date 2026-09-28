@@ -1,7 +1,10 @@
 node_modules/
 dist/
 .env
-data/
+data/*
+!data/README.md
+!data/examples/
+!data/examples/*.json
 .env.local
 *.log
 public/generated-images/

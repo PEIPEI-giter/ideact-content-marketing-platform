@@ -25,8 +25,14 @@ export type KnowledgeProduct = {
 
 export function loadKnowledgeBases(env: NodeJS.ProcessEnv): KnowledgeBaseConfig[] {
   const bases: KnowledgeBaseConfig[] = [];
+  const indexes = [...new Set(
+    Object.keys(env)
+      .map((key) => key.match(/^KB_(\d+)_/)?.[1])
+      .filter((value): value is string => Boolean(value))
+      .map(Number),
+  )].sort((a, b) => a - b);
 
-  for (let index = 1; index <= 2; index += 1) {
+  for (const index of indexes) {
     const prefix = `KB_${index}_`;
     const id = env[`${prefix}ID`]?.trim();
     const name = env[`${prefix}NAME`]?.trim();
@@ -62,6 +68,10 @@ export function publicKnowledgeBase(base: KnowledgeBaseConfig) {
     endpoint: base.endpoint,
     regionId: base.regionId,
   };
+}
+
+export function hasKnowledgeBaseIndex(indices: Array<{ id?: string }> | undefined, indexId: string) {
+  return Boolean(indices?.some((index) => index.id === indexId));
 }
 
 export function toSafeError(error: unknown): string {

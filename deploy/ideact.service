@@ -1,0 +1,24 @@
+[Unit]
+Description=Ideact content marketing platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=peipei
+WorkingDirectory=/home/peipei/ideact
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+Environment=WEB_ORIGIN=https://121.41.88.142
+Environment=NODE_ENV=production
+Environment=MVP_COOKIE_SECURE=true
+Environment=PATH=/home/peipei/.local/node-v24.21.0-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/peipei/.local/node-v24.21.0-linux-x64/bin/node /home/peipei/ideact/node_modules/tsx/dist/cli.mjs /home/peipei/ideact/server/index.ts
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

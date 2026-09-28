@@ -1,5 +1,6 @@
 import express from "express";
 import "dotenv/config";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import BailianClientModule from "@alicloud/bailian20231229";
@@ -9,6 +10,7 @@ import { RuntimeOptions } from "@darabonba/typescript/dist/core";
 import {
   buildGroundedPrompt,
   extractProductsFromCitations,
+  hasKnowledgeBaseIndex,
   loadKnowledgeBases,
   normalizeRetrieveNodes,
   publicKnowledgeBase,
@@ -35,20 +37,55 @@ import {
 } from "./image-workflow-utils";
 import { createAliyunCloudPhoneProviderFromEnv } from "./cloud-phone/providers/aliyun-cloud-phone-provider";
 import type { AgentTask, CloudPhoneConnection, CloudPhoneDevice } from "./cloud-phone/domain/types";
-import { buildPublishInstruction, isPublishDue, parsePublishRequest, PublishingStore, type PublishJob } from "./publishing";
+import { buildPublishInstruction, createPublishAlbum, isPublishDue, parsePublishRequest, publishAgentFailureMessage, publishProgressEvent, PublishingStore, type PublishJob } from "./publishing";
 import { registerPrivateInboxRoutes } from "./private-inbox-routes";
+import { detectXhsLoggedOut } from "./private-inbox";
+import { createAuthService } from "./auth";
+import { ContentWorkspaceStore, validateContentWorkspaceValues } from "./content-workspace";
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
+const host = process.env.HOST || "0.0.0.0";
 const BailianClient = (BailianClientModule as unknown as { default?: typeof BailianClientModule }).default || BailianClientModule;
 const cloudPhoneConnections = new Map<string, CloudPhoneConnection>();
 const cloudPhoneTasks = new Map<string, AgentTask & { deviceName?: string; providerReason?: string; steps?: string; duration?: string; requestId?: string }>();
 const cloudPhoneTaskIdempotency = new Map<string, string>();
 const publishingStore = new PublishingStore(path.join(process.cwd(), "data", "publishing-jobs.json"));
+const authService = createAuthService();
+const contentWorkspaceStore = new ContentWorkspaceStore(
+  process.env.CONTENT_WORKSPACE_PATH || path.join(process.cwd(), "data", "content-workspace.json"),
+);
 let publishingTickRunning = false;
 
-app.use(express.json({ limit: "1mb" }));
-app.use("/generated-images", express.static(path.join(process.cwd(), "public", "generated-images")));
+app.use(express.json({ limit: "10mb" }));
+app.get("/api/auth/status", authService.status);
+app.post("/api/auth/login", authService.login);
+app.post("/api/auth/logout", authService.logout);
+app.use("/api", authService.requireAuth);
+app.use("/generated-images", authService.requireAuth, express.static(path.join(process.cwd(), "public", "generated-images")));
+
+app.get("/api/content-workspace", async (_request, response) => {
+  try {
+    response.json(await contentWorkspaceStore.read());
+  } catch (error) {
+    response.status(500).json({ message: toSafeError(error) });
+  }
+});
+
+app.put("/api/content-workspace", async (request, response) => {
+  let values: Record<string, string>;
+  try {
+    values = validateContentWorkspaceValues(request.body?.values);
+  } catch (error) {
+    response.status(422).json({ message: toSafeError(error) });
+    return;
+  }
+  try {
+    response.json(await contentWorkspaceStore.replace(values));
+  } catch (error) {
+    response.status(500).json({ message: toSafeError(error) });
+  }
+});
 
 function getKnowledgeBases() {
   return loadKnowledgeBases(process.env);
@@ -390,11 +427,31 @@ async function changeCloudPhoneTask(req: express.Request, res: express.Response,
 }
 
 app.get("/api/publishing/capabilities", (_req, res) => {
-  res.json({ imageDeliveryReady: true, imageDeliveryMessage: "本机图片将在发布时传入云手机并校验，无需公网图片地址。" });
+  res.json({ imageDeliveryReady: true, imageDeliveryMessage: "千问生成图将通过阿里云 SendFile 整图直传云手机；本机副本继续保留。" });
 });
 
+function publicPublishJob(job: PublishJob) {
+  const { imageSources: _imageSources, ...safe } = job;
+  if (safe.status !== "FAILED" && isStatusSyncNetworkError(safe.errorMessage)) {
+    if (["SCHEDULED", "QUEUED", "PREPARING", "RUNNING"].includes(safe.status)) {
+      safe.syncWarning = "阿里云状态查询曾短暂中断，发布任务仍在执行，系统会自动继续查询，无需重新提交。";
+    }
+    safe.errorMessage = undefined;
+  }
+  return safe;
+}
+
+function isStatusSyncNetworkError(message?: string) {
+  return /socket hang up|ECONNRESET|ETIMEDOUT|EAI_AGAIN|network|temporarily unavailable/i.test(message || "");
+}
+
 app.get("/api/publishing/jobs", async (_req, res) => {
-  try { res.json({ jobs: await publishingStore.list() }); }
+  try {
+    const jobs = (await publishingStore.list()).map((job) => /任务TIMEOUT/.test(job.errorMessage || "")
+      ? { ...job, errorMessage: publishAgentFailureMessage("TIMEOUT", job.providerDuration, job.errorMessage) }
+      : job).map(publicPublishJob);
+    res.json({ jobs });
+  }
   catch { res.status(500).json({ message: "读取发布记录失败，请检查本地数据目录。" }); }
 });
 
@@ -405,20 +462,37 @@ app.post("/api/publishing/jobs", async (req, res) => {
       res.status(422).json({ message: "缺少有效的提交标识，请刷新页面后重试。" }); return;
     }
     const existing = await publishingStore.findIdempotency(idempotencyKey);
-    if (existing) { res.status(200).json({ job: existing, repeated: true }); return; }
+    if (existing) { res.status(200).json({ job: publicPublishJob(existing), repeated: true }); return; }
     const input = parsePublishRequest(req.body);
     for (const imagePath of input.imagePaths) {
       await fs.access(path.join(process.cwd(), "public", imagePath.slice(1)));
+    }
+    const provider = getCloudPhoneProvider();
+    const targetDevice = (await provider.describeDevices()).find((device) => device.id === input.deviceId);
+    if (!targetDevice || targetDevice.runtimeStatus !== "RUNNING") throw new Error("目标云手机当前不可用，请确认设备已经开机并处于运行中。");
+    try {
+      const hierarchy = await provider.runReadOnlyCommand(targetDevice, "uiautomator dump --compressed /proc/self/fd/1");
+      const loggedOut = detectXhsLoggedOut(hierarchy);
+      if (loggedOut) throw new Error(loggedOut);
+    } catch (error) {
+      if (error instanceof Error && /小红书登录失效/.test(error.message)) throw error;
+      // 页面不在小红书时无法判断登录状态，后续仍由真实发布任务处理。
     }
     const now = new Date().toISOString();
     const job: PublishJob = {
       id: crypto.randomUUID(), idempotencyKey, ...input,
       approvedAt: now, status: input.mode === "scheduled" ? "SCHEDULED" : "QUEUED",
+      progressEvents: [publishProgressEvent("queued", input.mode === "scheduled" ? "等待预约时间" : "发布任务已保存", input.mode === "scheduled" ? `将在 ${input.scheduledAt} 进入执行队列。` : "审核内容和目标设备已保存，等待服务端开始处理。", input.mode === "scheduled" ? "pending" : "completed", now)],
       createdAt: now, updatedAt: now,
     };
-    buildPublishInstruction(job, input.imagePaths.map((imagePath, index) => `/sdcard/Download/ideact-${job.id}-${index + 1}${path.extname(imagePath)}`));
+    const album = createPublishAlbum(job.id);
+    buildPublishInstruction(
+      job,
+      input.imagePaths.map((imagePath, index) => `${album.directory}/${String(index + 1).padStart(2, "0")}${path.extname(imagePath).toLowerCase()}`),
+      album.name,
+    );
     const saved = await publishingStore.save(job);
-    res.status(saved.repeated ? 200 : 201).json(saved);
+    res.status(saved.repeated ? 200 : 201).json({ ...saved, job: publicPublishJob(saved.job) });
     if (!saved.repeated) void runPublishingTick();
   } catch (error) {
     const message = error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT"
@@ -433,15 +507,16 @@ app.post("/api/publishing/jobs/:jobId/cancel", async (req, res) => {
   if (!job) { res.status(404).json({ message: "未找到发布任务。" }); return; }
   if (!["SCHEDULED", "QUEUED"].includes(job.status)) { res.status(409).json({ message: "任务已进入执行阶段，不能从这里取消；请到操控中心查看云手机。" }); return; }
   const updated = await publishingStore.update(job.id, { status: "CANCELED" });
-  res.json({ job: updated });
+  res.json({ job: updated ? publicPublishJob(updated) : updated });
 });
 
 app.post("/api/publishing/jobs/:jobId/confirm", async (req, res) => {
   const job = await publishingStore.find(req.params.jobId);
   if (!job) { res.status(404).json({ message: "未找到发布任务。" }); return; }
   if (job.status !== "REVIEW_REQUIRED") { res.status(409).json({ message: "只有 AI 执行完成、待人工核验的任务才能确认已发布。" }); return; }
-  const updated = await publishingStore.update(job.id, { status: "PUBLISHED", publishedAt: new Date().toISOString() });
-  res.json({ job: updated });
+  const publishedAt = new Date().toISOString();
+  const updated = await publishingStore.updateProgress(job.id, { status: "PUBLISHED", publishedAt }, publishProgressEvent("review", "人工核验完成", "运营人员已在目标平台确认内容发布完成。", "completed", publishedAt));
+  res.json({ job: updated ? publicPublishJob(updated) : updated });
 });
 
 async function runPublishingTick() {
@@ -461,11 +536,20 @@ async function runPublishingTick() {
           instruction: "", status: "RUNNING", providerTaskId: job.providerTaskId,
           createdAt: job.createdAt, updatedAt: job.updatedAt,
         } });
-        if (task.status === "COMPLETED") await publishingStore.update(job.id, { status: "REVIEW_REQUIRED", providerSteps: task.steps, providerDuration: task.duration, providerResult: task.result || "AI 任务执行完成，请在平台账号中核实帖子是否真正发布。" });
-        else if (["FAILED", "TIMEOUT", "CANCELED", "STOPPED"].includes(task.status)) await publishingStore.update(job.id, { status: "FAILED", providerSteps: task.steps, providerDuration: task.duration, errorMessage: task.errorMessage || `云手机任务${task.status}，未确认发布成功。` });
-        else if (task.steps !== job.providerSteps || task.duration !== job.providerDuration) await publishingStore.update(job.id, { providerSteps: task.steps, providerDuration: task.duration });
+        if (task.status === "COMPLETED") {
+          await publishingStore.updateProgress(job.id, { status: "REVIEW_REQUIRED", providerSteps: task.steps, providerDuration: task.duration, providerResult: task.result || "AI 任务执行完成，请在平台账号中核实帖子是否真正发布。", errorMessage: undefined, syncWarning: undefined }, publishProgressEvent("executing", "AI 操作已结束", `阿里云任务已完成${task.steps ? `，共执行 ${task.steps} 步` : ""}${task.duration ? `，用时 ${task.duration} 秒` : ""}。`, "completed"));
+          await publishingStore.updateProgress(job.id, {}, publishProgressEvent("review", "等待人工核验", "请在实时画面或目标平台确认帖子、文案和图片无误。", "running"));
+        } else if (["FAILED", "TIMEOUT", "CANCELED", "STOPPED"].includes(task.status)) {
+          const failure = publishAgentFailureMessage(task.status, task.duration, task.errorMessage);
+          await publishingStore.updateProgress(job.id, { status: "FAILED", providerSteps: task.steps, providerDuration: task.duration, errorMessage: failure, syncWarning: undefined }, publishProgressEvent("executing", "AI 执行未完成", failure, "failed"));
+        } else if (task.steps !== job.providerSteps || task.duration !== job.providerDuration || job.errorMessage || job.syncWarning) {
+          await publishingStore.updateProgress(job.id, { providerSteps: task.steps, providerDuration: task.duration, errorMessage: undefined, syncWarning: undefined }, publishProgressEvent("executing", "AI 正在操作云手机", task.steps ? `阿里云已执行 ${task.steps} 步，实时画面会同步显示当前操作。` : "阿里云任务运行中，正在等待返回已执行步数。", "running"));
+        }
       } catch (error) {
-        await publishingStore.update(job.id, { errorMessage: maskCloudPhoneError(error) });
+        await publishingStore.update(job.id, {
+          errorMessage: undefined,
+          syncWarning: "阿里云状态查询暂时中断，任务记录已保留，系统会自动继续查询。请勿重复提交发布。",
+        });
       }
     }
 
@@ -475,47 +559,90 @@ async function runPublishingTick() {
       const all = await publishingStore.list();
       if (all.some((item) => item.id !== job.id && item.deviceId === job.deviceId && ["PREPARING", "RUNNING"].includes(item.status))) continue;
       if ([...cloudPhoneTasks.values()].some((item) => item.deviceId === job.deviceId && isActiveAgentTask(item))) continue;
-      await publishingStore.update(job.id, { status: "PREPARING", errorMessage: undefined });
+      await publishingStore.updateProgress(job.id, { status: "PREPARING", errorMessage: undefined }, publishProgressEvent("preparing", "校验设备与素材", "正在确认云手机在线状态、文案和所选图片。", "running"));
       let agentDispatchStarted = false;
       try {
         const provider = getCloudPhoneProvider();
         const devices = await provider.describeDevices();
         const device = devices.find((item) => item.id === job.deviceId || item.instanceId === job.deviceId);
         if (!device || device.runtimeStatus !== "RUNNING") throw new Error("目标云手机不在线，发布任务未执行。" );
-        const devicePaths: string[] = [];
-        for (const [index, imagePath] of job.imagePaths.entries()) {
-          const extension = path.extname(imagePath);
-          const targetPath = `/sdcard/Download/ideact-${job.id}-${index + 1}${extension}`;
-          const image = await fs.readFile(path.join(process.cwd(), "public", imagePath.slice(1)));
-          await provider.sendLocalImageToDevice({
-            device, image, targetPath,
-            onProgress: async (completed, total) => {
-              if (completed === 1 || completed === total || completed % 10 === 0) {
-                await publishingStore.update(job.id, { imageTransfer: { image: index + 1, totalImages: job.imagePaths.length, completed, total } });
-              }
-            },
-          });
-          devicePaths.push(targetPath);
+        if (job.imagePaths.length > 0 && (!Array.isArray(job.imageSources) || job.imageSources.length !== job.imagePaths.length)) {
+          throw new Error("发布记录缺少图片直传地址。请回到内容生产流水线重新生成图片，再创建新的发布任务。");
         }
-        const instruction = buildPublishInstruction(job, devicePaths);
+        const album = createPublishAlbum(job.id);
+        await publishingStore.updateProgress(job.id, {}, publishProgressEvent("preparing", "设备与素材校验完成", "目标云手机在线，发布内容和图片来源有效。", "completed"));
+        if (job.imagePaths.length > 0) {
+          await publishingStore.updateProgress(job.id, {}, publishProgressEvent("images", "传入本次发布图片", `正在把 ${job.imagePaths.length} 张图片传入任务独立相册。`, "running"));
+          await provider.preparePublishAlbum({ device, directory: album.directory });
+          await publishingStore.update(job.id, { deviceAlbum: album.name });
+        }
+        const devicePaths = Array<string>(job.imagePaths.length);
+        let completedImages = 0;
+        await mapWithConcurrency(job.imagePaths, 3, async (imagePath, index) => {
+          const extension = path.extname(imagePath);
+          const targetPath = `${album.directory}/${String(index + 1).padStart(2, "0")}${extension.toLowerCase()}`;
+          const image = await fs.readFile(path.join(process.cwd(), "public", imagePath.slice(1)));
+          await publishingStore.update(job.id, {
+            imageTransfer: { image: index + 1, totalImages: job.imagePaths.length, completed: completedImages, total: job.imagePaths.length, mode: "direct-url" },
+          });
+          await provider.sendFileToDevice({
+            device,
+            sourceUrl: job.imageSources[index],
+            targetPath,
+            fileMd5: crypto.createHash("md5").update(image).digest("hex"),
+            idempotencyKey: `${job.id}-${index + 1}`,
+          });
+          devicePaths[index] = targetPath;
+          completedImages += 1;
+          await publishingStore.update(job.id, {
+            imageTransfer: { image: index + 1, totalImages: job.imagePaths.length, completed: completedImages, total: job.imagePaths.length, mode: "direct-url" },
+          });
+        });
+        await provider.refreshPublishImages({ device, paths: devicePaths });
+        await publishingStore.updateProgress(job.id, {}, publishProgressEvent("images", job.imagePaths.length ? "图片传输完成" : "本次无需配图", job.imagePaths.length ? `${job.imagePaths.length} 张图片已进入云手机独立相册并完成媒体索引。` : "本次发布没有选择图片。", "completed"));
+        const instruction = buildPublishInstruction(job, devicePaths, album.name);
         agentDispatchStarted = true;
+        await publishingStore.updateProgress(job.id, {}, publishProgressEvent("dispatching", "提交阿里云 Mobile Agent", "正在创建自动发布任务，只会提交一次。", "running"));
         const task = await provider.runAgentTask({ device, instruction, idempotencyKey: job.id });
-        await publishingStore.update(job.id, {
+        const providerStartedAt = new Date().toISOString();
+        await publishingStore.updateProgress(job.id, {
           status: task.status === "COMPLETED" ? "REVIEW_REQUIRED" : ["FAILED", "TIMEOUT"].includes(task.status) ? "FAILED" : "RUNNING",
-          providerTaskId: task.providerTaskId, providerResult: task.result, errorMessage: task.errorMessage,
-        });
+          providerTaskId: task.providerTaskId,
+          providerStartedAt,
+          providerResult: task.result,
+          providerDuration: task.duration,
+          providerSteps: task.steps,
+          errorMessage: ["FAILED", "TIMEOUT"].includes(task.status) ? publishAgentFailureMessage(task.status, task.duration, task.errorMessage) : undefined,
+          syncWarning: undefined,
+        }, publishProgressEvent("dispatching", "阿里云任务已接收", `任务编号 ${task.providerTaskId || "未返回"}，已进入执行链路。`, "completed", providerStartedAt));
+        if (!["COMPLETED", "FAILED", "TIMEOUT"].includes(task.status)) {
+          await publishingStore.updateProgress(job.id, {}, publishProgressEvent("executing", "AI 正在操作云手机", "已开始执行发布动作，可在右侧实时画面查看。", "running", providerStartedAt));
+        }
       } catch (error) {
-        await publishingStore.update(job.id, {
+        const failure = agentDispatchStarted
+          ? `提交云手机任务后状态不明，请先核验平台账号，避免重复发布。详情：${maskCloudPhoneError(error)}`
+          : maskCloudPhoneError(error);
+        await publishingStore.updateProgress(job.id, {
           status: agentDispatchStarted ? "REVIEW_REQUIRED" : "FAILED",
-          errorMessage: agentDispatchStarted
-            ? `提交云手机任务后状态不明，请先核验平台账号，避免重复发布。详情：${maskCloudPhoneError(error)}`
-            : maskCloudPhoneError(error),
-        });
+          errorMessage: failure,
+        }, publishProgressEvent(agentDispatchStarted ? "executing" : "preparing", agentDispatchStarted ? "任务状态需要人工核验" : "发布准备失败", failure, agentDispatchStarted ? "running" : "failed"));
       }
     }
   } catch (error) {
     console.error("发布队列处理失败：", error instanceof Error ? error.message : "未知错误");
   } finally { publishingTickRunning = false; }
+}
+
+async function mapWithConcurrency<T>(items: T[], concurrency: number, run: (item: T, index: number) => Promise<void>) {
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      await run(items[index], index);
+    }
+  });
+  await Promise.all(workers);
 }
 
 app.get("/api/knowledge/bases", (_req, res) => {
@@ -539,8 +666,12 @@ app.get("/api/knowledge/bases/:id/health", async (req, res) => {
     const client = createBailianClient(base);
     const request = new ListIndicesRequest({});
     const runtime = new RuntimeOptions({});
-    await client.listIndicesWithOptions(base.workspaceId, request, {}, runtime);
-    res.json({ ok: true, checkedAt: new Date().toISOString() });
+    const response = await client.listIndicesWithOptions(base.workspaceId, request, {}, runtime);
+    const matchedIndex = response.body?.data?.indices?.find((index) => index.id === base.indexId);
+    if (!hasKnowledgeBaseIndex(response.body?.data?.indices, base.indexId) || !matchedIndex) {
+      throw new Error(`业务空间可访问，但未找到配置的知识库 ID：${base.indexId}。`);
+    }
+    res.json({ ok: true, knowledgeBaseName: matchedIndex.name || base.name, checkedAt: new Date().toISOString() });
   } catch (error) {
     res.status(500).json({
       ok: false,
@@ -669,8 +800,10 @@ app.post("/api/social/topics/generate", async (req, res) => {
 app.post("/api/social/copy/generate", async (req, res) => {
   const context = req.body?.context as CopywritingContext;
 
+  try { validateCopywritingContext(context); }
+  catch (error) { res.status(422).json({ message: toSafeError(error) }); return; }
+
   try {
-    validateCopywritingContext(context);
     const base = getBaseOrThrow(context.object.knowledgeBaseId);
     const requestedChannels = normalizeChannels(context.brief.channels);
     const productQuery = context.brief.useProduct && context.brief.product
@@ -725,12 +858,28 @@ app.get("/api/social/image-models", (_req, res) => {
   });
 });
 
+app.get("/api/social/model-status", (_req, res) => {
+  const configured = Boolean(process.env.DASHSCOPE_API_KEY?.trim());
+  res.json({
+    text: {
+      configured,
+      model: process.env.DASHSCOPE_TEXT_MODEL?.trim() || process.env.DASHSCOPE_MODEL?.trim() || "qwen3.7-plus",
+    },
+    image: {
+      configured,
+      model: process.env.DASHSCOPE_IMAGE_MODEL?.trim() || "qwen-image-plus",
+    },
+  });
+});
+
 app.post("/api/social/images/directions", async (req, res) => {
   const context = req.body?.context as CopywritingContext;
   const copies = Array.isArray(req.body?.copies) ? req.body.copies : [];
 
+  try { validateCopywritingContext(context); }
+  catch (error) { res.status(422).json({ message: toSafeError(error) }); return; }
+
   try {
-    validateCopywritingContext(context);
     const generated = await generateText({
       messages: buildVisualDirectionsPrompt(context, copies),
       temperature: 0.72,
@@ -750,8 +899,10 @@ app.post("/api/social/images/directions", async (req, res) => {
 app.post("/api/social/images/generate", async (req, res) => {
   const request = req.body as SocialImageRequest;
 
+  try { validateSocialImageRequest(request); }
+  catch (error) { res.status(422).json({ message: toSafeError(error) }); return; }
+
   try {
-    validateSocialImageRequest(request);
     const generated = await generateImage({
       prompt: buildSocialImagePrompt(request),
       size: request.size,
@@ -789,13 +940,19 @@ async function saveGeneratedImage(url: string, taskId: string, index: number) {
   return `/generated-images/${filename}`;
 }
 
-app.listen(port, () => {
-  console.log(`Knowledge API server listening on http://localhost:${port}`);
+app.use(express.static(path.join(process.cwd(), "dist")));
+
+app.listen(port, host, () => {
+  console.log(`Knowledge API server listening on http://${host}:${port}`);
   void (async () => {
     try {
       for (const job of await publishingStore.list()) {
         if (job.status === "PREPARING") await publishingStore.update(job.id, {
           status: "REVIEW_REQUIRED", errorMessage: "服务在准备发布时中断，可能已传图或提交任务；请先在云手机核验，避免重复发布。",
+        });
+        else if (job.status === "REVIEW_REQUIRED" && isStatusSyncNetworkError(job.errorMessage)) await publishingStore.update(job.id, {
+          errorMessage: undefined,
+          syncWarning: undefined,
         });
       }
       await runPublishingTick();
